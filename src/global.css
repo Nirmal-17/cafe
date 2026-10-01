@@ -1,0 +1,145 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800;900&display=swap');
+
+:root {
+  --font-display: 'Archivo', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, monospace;
+  --font-rounded: 'Archivo', sans-serif;
+  --font-serif: 'Archivo', sans-serif;
+
+  --brand-yellow: #FFD600;
+  --brand-orange: #FF6D00;
+  --brand-dark-orange: #E65100;
+  --brand-black: #000000;
+  --brand-white: #FFFFFF;
+  --brand-crimson: #EF0039;
+  --brand-blue: #073F78;
+}
+
+/* Web-specific hover effects */
+@media (hover: hover) and (pointer: fine) {
+  .btn-hover-primary:hover {
+    background-color: var(--brand-orange) !important;
+    color: var(--brand-white) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(255, 109, 0, 0.3);
+  }
+  
+  .btn-hover-secondary:hover {
+    background-color: var(--brand-yellow) !important;
+    color: var(--brand-black) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(255, 214, 0, 0.3);
+  }
+  
+  .btn-hover-outline:hover {
+    background-color: var(--brand-orange) !important;
+    color: var(--brand-white) !important;
+    border-color: var(--brand-orange) !important;
+    transform: translateY(-1px);
+  }
+  
+  .btn-hover-ghost:hover {
+    background-color: rgba(255, 109, 0, 0.15) !important;
+    color: var(--brand-orange) !important;
+  }
+  
+  .btn-hover-danger:hover {
+    background-color: #C62828 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(211, 47, 47, 0.3);
+  }
+  
+  .btn-hover-success:hover {
+    background-color: #2E7D32 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(46, 125, 50, 0.3);
+  }
+  
+  /* Table card hover effects */
+  .table-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(255, 109, 0, 0.12) !important;
+  }
+  
+  .table-card-available:hover {
+    border-color: var(--brand-orange) !important;
+    background-color: #1A2A1A !important;
+  }
+  
+  .table-card-occupied:hover {
+    border-color: #D32F2F !important;
+  }
+  
+  .table-card-reserved:hover {
+    border-color: var(--brand-orange) !important;
+  }
+  
+  /* Chip hover effects */
+  .chip:hover:not(.chip-active) {
+    background-color: #1A2A1A !important;
+    border-color: var(--brand-orange) !important;
+    color: var(--brand-orange) !important;
+  }
+  
+  /* Icon button hover effects */
+  .icon-btn:hover {
+    background-color: rgba(255, 109, 0, 0.15) !important;
+    transform: scale(1.05);
+  }
+  
+  /* Input focus/hover effects */
+  .input-wrapper:hover {
+    border-color: var(--brand-orange) !important;
+  }
+  
+  .input-wrapper:focus-within {
+    border-color: var(--brand-orange) !important;
+    box-shadow: 0 0 0 3px rgba(255, 109, 0, 0.2);
+  }
+  
+  /* Card hover effects */
+  .card-hover:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(255, 109, 0, 0.1) !important;
+  }
+  
+  /* Link hover effects */
+  .link:hover {
+    color: var(--brand-orange) !important;
+  }
+  
+  /* Tab hover effects */
+  .tab:hover:not(.tab-active) {
+    background-color: #1A2A1A !important;
+    color: var(--brand-orange) !important;
+  }
+  
+  /* Dropdown/menu item hover */
+  .menu-item:hover {
+    background-color: #1A2A1A !important;
+    color: var(--brand-white) !important;
+  }
+  
+  /* Go to top button hover */
+  .go-to-top:hover {
+    background-color: var(--brand-orange) !important;
+    transform: scale(1.1);
+  }
+  
+  /* Transition utilities */
+  .transition-all {
+    transition: all 0.15s ease;
+  }
+  
+  .transition-transform {
+    transition: transform 0.15s ease;
+  }
+  
+  .transition-colors {
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+}
+
+* {
+  font-family: 'Archivo', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+}

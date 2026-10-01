@@ -1,0 +1,272 @@
+CafeOS API Documentation & Routes
+Base URL Default: https://cafe.leadingedge.com.np
+All routes are prefixed with /api/... (e.g. https://cafe.leadingedge.com.np/api/...)
+
+---
+
+### 1. Authentication
+- **GET /api/auth/me**
+  - Description: Get current authenticated staff user details.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 1,
+        "name": "Staff Admin",
+        "email": "admin@cafeos.com",
+        "role": "ADMIN",
+        "pin": "1234"
+      }
+    }
+    ```
+
+- **POST /api/auth/logout**
+  - Description: Logout current staff session.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "message": "Logged out successfully"
+      }
+    }
+    ```
+
+---
+
+### 2. Settings
+- **GET /api/settings**
+  - Description: Get cafe configuration and settings.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "cafeName": "CafeOS Kathmandu",
+        "currency": "Rs.",
+        "taxRate": 13,
+        "serviceChargeRate": 10,
+        "printerEnabled": true
+      }
+    }
+    ```
+
+---
+
+### 3. Sections & Tables
+- **GET /api/tables** (or `/api/admin/tables`)
+  - Description: Get list of tables grouped or by section.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": [
+        {
+          "id": 1,
+          "sectionId": 1,
+          "tableNumber": "Table 1",
+          "capacity": 4,
+          "status": "AVAILABLE"
+        },
+        {
+          "id": 2,
+          "sectionId": 1,
+          "tableNumber": "Table 2",
+          "capacity": 2,
+          "status": "OCCUPIED"
+        }
+      ]
+    }
+    ```
+
+- **GET /api/tables/{id}**
+  - Description: Get details for a specific table.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 1,
+        "sectionId": 1,
+        "tableNumber": "Table 1",
+        "capacity": 4,
+        "status": "OCCUPIED",
+        "activeOrders": []
+      }
+    }
+    ```
+
+- **PATCH /api/tables/{id}/status**
+  - Description: Update table status (e.g. AVAILABLE, OCCUPIED, RESERVED).
+  - Payload: `{"status": "OCCUPIED"}`
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 1,
+        "tableNumber": "Table 1",
+        "status": "OCCUPIED"
+      }
+    }
+    ```
+
+---
+
+### 4. Menu & Categories
+- **GET /api/menu** (or `/api/admin/menu/categories` & `/api/admin/menu/items`)
+  - Description: Get menu categories and items.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": [
+        {
+          "id": 1,
+          "name": "Beverages",
+          "items": [
+            {
+              "id": 101,
+              "categoryId": 1,
+              "name": "Chiyya (Tea)",
+              "price": 50,
+              "available": true
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+---
+
+### 5. Orders & KDS
+- **GET /api/orders/active**
+  - Description: Get active orders across tables and kitchen.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": [
+        {
+          "id": 101,
+          "tableId": 1,
+          "waiterId": 1,
+          "status": "PREPARING",
+          "paymentStatus": "UNPAID",
+          "totalAmount": 350,
+          "items": [
+            {
+              "id": 1,
+              "orderId": 101,
+              "menuItemId": 101,
+              "quantity": 1,
+              "price": 350,
+              "status": "PREPARING"
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+- **POST /api/orders**
+  - Description: Create a new order or add items to an existing active order for a table.
+  - Payload:
+    ```json
+    {
+      "tableId": 1,
+      "waiterId": 1,
+      "items": [
+        { "menuItemId": 101, "quantity": 2, "price": 150 }
+      ]
+    }
+    ```
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 102,
+        "tableId": 1,
+        "status": "PENDING",
+        "totalAmount": 300,
+        "items": [...]
+      }
+    }
+    ```
+
+- **PATCH /api/orders/{id}/status**
+  - Description: Update order status (PENDING, PREPARING, READY, SERVED, CANCELLED).
+  - Payload: `{"status": "PREPARING"}`
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 102,
+        "status": "PREPARING"
+      }
+    }
+    ```
+
+- **POST /api/orders/{id}/request-bill**
+  - Description: Request bill for an order.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": 102,
+        "status": "BILL_REQUESTED"
+      }
+    }
+    ```
+
+---
+
+### 6. QR Code & Payments (POS)
+- **GET /api/qr**
+  - Description: Get payment QR code URL or image.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "qrUrl": "https://cafe.leadingedge.com.np/qr-code.png"
+      }
+    }
+    ```
+
+- **GET /api/cashier/unpaid-bills**
+  - Description: Get list of unpaid bills for cashier POS.
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": [...]
+    }
+    ```
+
+- **POST /api/cashier/checkout**
+  - Description: Process payment and checkout table/order.
+  - Payload:
+    ```json
+    {
+      "tableId": 1,
+      "orderIds": [102],
+      "paymentMethod": "QR",
+      "amountPaid": 300
+    }
+    ```
+  - Dummy Response (JSON):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "payment": { "id": 10, "method": "QR", "status": "SUCCESS" },
+        "order": { "id": 102, "paymentStatus": "PAID" }
+      }
+    }
+    ```
