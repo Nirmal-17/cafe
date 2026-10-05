@@ -42,12 +42,18 @@ CafeOS — restaurant POS (waiter + kitchen + cashier) built as Expo SDK 57 / Re
 - Session closes automatically: final payment checkout, order COMPLETED/CANCELLED freeing table, status change. First order auto-opens session
 - Guest count fully removed (schema `guest_count` column dropped, API/UI picker, "Guests Seated" KPI) — sessions track occupancy only
 - Remote table sync opt-in via `REMOTE_TABLES_URL`, preserves real capacity
-- Frontend api.ts SINGLE-URL client: saved URL > EXPO_PUBLIC_API_URL > same-origin(web)/localhost:3000(native). Cascade/multi-host login/mock fallbacks/getExploreMenuDirect ALL REMOVED. New: startTableSession, getPrinterStatus, pingHealth, resetBaseUrl
+- Frontend api.ts SINGLE-URL client (`src/config/apiConfig.ts`): saved URL > EXPO_PUBLIC_API_URL > production (`https://cafeos.leadingedge.com.np`) — the old same-origin(web)/localhost:3000(native) default made "Reset Default" a no-op whenever the saved URL was localhost. Cascade/multi-host login/mock fallbacks/getExploreMenuDirect ALL REMOVED. New: startTableSession, getPrinterStatus, pingHealth, resetBaseUrl
 - index.tsx: client-side tableSessions storage gone; DEFAULT_SCREENSHOT_ORDERS, +5/+18/+8450 fake metrics, fake latency/printer, static notifications all REMOVED (now real/derived)
 - MyTableScreen uses `table.activeSession`; real unread badge
 - CRITICAL SQLite lesson: inside `prisma.$transaction(async (tx) => ...)` ALL queries must use `tx`, never the global prisma client (lock conflict → "Failed to start table session" 500)
 
-## Dev logins (local DB)
+### Phase 3.5 — demo data removed + per-URL logins (2026-10-02, uncommitted)
+- ALL offline/demo fallbacks DELETED: `src/services/demoData.ts` (714-line mock backend), `DEMO_ACCOUNTS`, `offlineLogin`/`unreachableLogin`/`demoFallback`, `isOfflineSession()`, `ApiResponse.offline`, root `login.json`, and the "Backend offline — demo login: …" banner. Login now fails honestly on unreachable server / wrong credentials (15s `AbortSignal.timeout` on `/auth/login`).
+- NEW `src/utils/sessions.ts`: `{token, user, username}` stored per normalized URL under one `smart_cafe_sessions` map; the ACTIVE session is always the one for `smart_cafe_base_url`. Legacy `smart_cafe_token` / `smart_cafe_user` / `smart_cafe_saved_username` keys removed — existing users sign in once again.
+- LoginScreen: Server URL input is HIDDEN by default — triple-tap the brand logo (loginlogo.jpg) to reveal/toggle the card; the typed URL is applied before every login attempt; username prefills per URL (untouched field only); debounced `/health` ping of the typed URL.
+- URL switch (`api.setBaseUrl` / `resetBaseUrl`): adopts that URL's own token (or none) and wipes menu/tables/active-order caches; `index.tsx applyServerUrl` re-derives auth state (signed in iff the new URL has a session) and clears notifications + cleared-history. Profile → Configure Server URL and the login screen both use this path.
+
+## Dev logins (local DB — only against a running backend)
 - waiter@leadingedge.com / Wait3rCafe123 (WAITER)
 - chef@leadingedge.com / Ch3fCafe123 (CHEF)
 - cashier@leadingedge.com / Cash1erCafe123 (CASHIER)
@@ -55,7 +61,7 @@ Passwords come from backend/.env SEED_*_PASSWORD (fallback defaults if unset).
 
 ## Commands
 - Backend dev: `cd backend && npm run dev` (ts-node-dev); build: `npx tsc` → run `node dist/app.js`
-- Frontend dev: `npx expo start`; typecheck `npx tsc --noEmit`; lint `npx expo lint` (0 errors, ~31 warnings pre-existing)
+- Frontend dev: `npx expo start`; typecheck `npx tsc --noEmit`; lint `npx expo lint` (0 errors, ~32 warnings pre-existing)
 - DB: `npx prisma db push --accept-data-loss` then `npx ts-node prisma/seed.ts` (from backend/)
 - Verify both typecheck BEFORE any commit; smoke-test on http://localhost:3000 (careless re-login from same IP in tests → 429 rate limit; restart server to clear)
 - Test payload gotcha: PowerShell `node -e` mangles `$` — write temp .js scripts instead. Prisma scripts must run with cwd=backend for @prisma/client resolution

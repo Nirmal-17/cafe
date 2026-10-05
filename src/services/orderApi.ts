@@ -69,7 +69,7 @@ export const orderApi = {
     const [table, menu, settings] = await Promise.all([
       safe(api.getTable(tableId)),
       // force: this screen submits these menu ids to the backend, so a stale
-      // (or demo) snapshot would be rejected with "Menu item not found".
+        // A stale snapshot would be rejected with "Menu item not found".
       safe(api.getMenu({ force: true })),
       safe(api.getSettings()),
     ]);

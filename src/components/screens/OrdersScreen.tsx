@@ -75,6 +75,7 @@ interface OrdersScreenProps {
   onShowDrawer: () => void;
   onOrderPress: (tableId: number) => void;
   onOrderStatusChange: (orderId: number, newStatus: string) => void;
+  onBookTable: () => void;
 }
 
 interface TableSection {
@@ -98,6 +99,7 @@ export function OrdersScreen({
   onShowDrawer,
   onOrderPress,
   onOrderStatusChange,
+  onBookTable,
 }: OrdersScreenProps) {
   const { breakpoint } = useResponsive();
   const scrollViewRef = useRef<ScrollView>(null);
@@ -419,93 +421,7 @@ export function OrdersScreen({
         </View>
       </View>
 
-      {/* Search */}
-      <View style={styles.searchContainer}>
-        <View style={styles.searchBarWrapper}>
-          <MaterialIcons
-            name="search"
-            size={22}
-            color={TEXT_MUTED}
-            style={styles.searchIcon}
-          />
-
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search by table name or order ID..."
-            placeholderTextColor={TEXT_MUTED}
-            value={ordersSearchQuery}
-            onChangeText={setOrdersSearchQuery}
-            autoCorrect={false}
-            autoCapitalize="none"
-            returnKeyType="search"
-          />
-
-          {ordersSearchQuery.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setOrdersSearchQuery('')}
-              activeOpacity={0.7}
-              accessibilityRole="button"
-              accessibilityLabel="Clear search"
-            >
-              <MaterialIcons
-                name="cancel"
-                size={20}
-                color={TEXT_MUTED}
-              />
-            </TouchableOpacity>
-          )}
-        </View>
-      </View>
-
-      {/* Status filters */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={styles.filterScroll}
-        contentContainerStyle={styles.chipsRow}
-      >
-        {(
-          [
-            'ALL',
-            'SERVED',
-          ] as const
-        ).map((status) => {
-          const isActive =
-            orderStatusFilter === status;
-
-          return (
-            <Hoverable
-              key={status}
-              style={[
-                styles.chip,
-                isActive && styles.chipActive,
-              ]}
-              onPress={() =>
-                setOrderStatusFilter(status)
-              }
-              hoverOpacity={0.8}
-              accessibilityRole="button"
-              accessibilityState={{
-                selected: isActive,
-              }}
-            >
-              <Text
-                style={[
-                  styles.chipText,
-                  isActive && styles.chipTextActive,
-                ]}
-              >
-                {status === 'ALL'
-                  ? 'All'
-                  : status.charAt(0) +
-                    status.slice(1).toLowerCase()}
-              </Text>
-            </Hoverable>
-          );
-        })}
-      </ScrollView>
-
-      {/* Orders */}
+      {/* Search, filters, CTA and orders all scroll together */}
       <ScrollView
         ref={scrollViewRef}
         style={styles.bodyScroll}
@@ -522,6 +438,114 @@ export function OrdersScreen({
           />
         }
       >
+        {/* Search */}
+        <View style={styles.searchContainer}>
+          <View style={styles.searchBarWrapper}>
+            <MaterialIcons
+              name="search"
+              size={22}
+              color={TEXT_MUTED}
+              style={styles.searchIcon}
+            />
+
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search by table name or order ID..."
+              placeholderTextColor={TEXT_MUTED}
+              value={ordersSearchQuery}
+              onChangeText={setOrdersSearchQuery}
+              autoCorrect={false}
+              autoCapitalize="none"
+              returnKeyType="search"
+            />
+
+            {ordersSearchQuery.length > 0 && (
+              <TouchableOpacity
+                onPress={() => setOrdersSearchQuery('')}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel="Clear search"
+              >
+                <MaterialIcons
+                  name="cancel"
+                  size={20}
+                  color={TEXT_MUTED}
+                />
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+
+        {/* Status filters */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.filterScroll}
+          contentContainerStyle={styles.chipsRow}
+        >
+          {(
+            [
+              'ALL',
+              'SERVED',
+            ] as const
+          ).map((status) => {
+            const isActive =
+              orderStatusFilter === status;
+
+            return (
+              <Hoverable
+                key={status}
+                style={[
+                  styles.chip,
+                  isActive && styles.chipActive,
+                ]}
+                onPress={() =>
+                  setOrderStatusFilter(status)
+                }
+                hoverOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityState={{
+                  selected: isActive,
+                }}
+              >
+                <Text
+                  style={[
+                    styles.chipText,
+                    isActive && styles.chipTextActive,
+                  ]}
+                >
+                  {status === 'ALL'
+                    ? 'All'
+                    : status.charAt(0) +
+                      status.slice(1).toLowerCase()}
+                </Text>
+              </Hoverable>
+            );
+          })}
+        </ScrollView>
+
+        {/* Book table for ordering */}
+        <View style={styles.bookTableRow}>
+          <Hoverable
+            style={styles.bookTableButton}
+            onPress={onBookTable}
+            hoverOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel="Book table for ordering"
+          >
+            <MaterialIcons
+              name="event-seat"
+              size={18}
+              color={BRAND_WHITE}
+            />
+            <Text style={styles.bookTableButtonText}>
+              Book table for ordering
+            </Text>
+          </Hoverable>
+        </View>
+
+        {/* Orders */}
+        <View style={styles.ordersWrap}>
         {/* Orders grouped by table */}
         {filteredTableSections.map((section) => (
           <View
@@ -833,6 +857,7 @@ export function OrdersScreen({
             />
           </View>
         )}
+        </View>
       </ScrollView>
 
       {/* Go to top */}
@@ -871,9 +896,12 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   },
 
   bodyContent: {
-    paddingHorizontal: getSpacing(bp.breakpoint, 'sm'),
-    paddingTop: getSpacing(bp.breakpoint, 'sm'),
     paddingBottom: getSpacing(bp.breakpoint, 'xxl'),
+  },
+
+  ordersWrap: {
+    paddingHorizontal: getSpacing(bp.breakpoint, 'sm'),
+    marginTop: getSpacing(bp.breakpoint, 'sm'),
   },
 
   // Header
@@ -988,6 +1016,36 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   chipTextActive: {
     color: BRAND_WHITE,
     fontWeight: '800',
+  },
+
+  // Book table CTA
+  bookTableRow: {
+    flexGrow: 0,
+    flexShrink: 0,
+    paddingHorizontal: getSpacing(bp.breakpoint, 'md'),
+    paddingBottom: getSpacing(bp.breakpoint, 'sm'),
+    backgroundColor: BG_DARK,
+  },
+
+  bookTableButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: getSpacing(bp.breakpoint, 'sm'),
+    height: getResponsiveValue({ xs: 38, sm: 40, md: 42, lg: 44, xl: 46 }, bp.breakpoint),
+    borderRadius: getBorderRadius(bp.breakpoint, 'sm'),
+    backgroundColor: BRAND_ORANGE,
+    ...(Platform.OS === 'web'
+      ? {
+          cursor: 'pointer',
+        }
+      : {}),
+  },
+
+  bookTableButtonText: {
+    color: BRAND_WHITE,
+    fontSize: getFontSize(bp.breakpoint, 'sm'),
+    fontWeight: '700',
   },
 
   // Table sections

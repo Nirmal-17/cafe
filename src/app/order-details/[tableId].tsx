@@ -21,7 +21,6 @@ import { webAlert } from '@/utils/webAlert';
 import { notifyOrderReady } from '@/utils/orderReadyToast';
 import { notifyOrderServed } from '@/utils/orderServedToast';
 import { notifyBillRequested } from '@/utils/orderBillToast';
-import { beginBillRequestHold, endBillRequestHold, isBillRequestHold } from '@/utils/billRequestHold';
 import { playAlertSound } from '@/utils/alertSound';
 import { switchMainTab } from '@/utils/mainTab';
 
@@ -137,7 +136,6 @@ export default function OrderDetailsScreen() {
   const handleRequestBill = async (order: Order) => {
     playAlertSound();
     setBillActionId(order.id);
-    beginBillRequestHold();
     try {
       const response = await orderApi.requestBill(order.id);
       if (!response.success) throw new Error(response.error);
@@ -148,22 +146,14 @@ export default function OrderDetailsScreen() {
         'Bill is requested for payment..',
         [{ text: 'OK' }]
       );
-      endBillRequestHold();
       switchMainTab('orders');
       router.dismissTo('/' as any);
     } catch (err: any) {
-      endBillRequestHold();
       await webAlert('Error', err?.message || 'Could not request the bill. Please try again.');
     } finally {
       setBillActionId(null);
     }
   };
-
-  useEffect(() => {
-    return () => {
-      if (isBillRequestHold()) endBillRequestHold();
-    };
-  }, []);
 
   const handleMarkServed = async (order: Order) => {
     try {
@@ -439,7 +429,7 @@ export default function OrderDetailsScreen() {
                   >
                     <MaterialIcons
                       name={order.paymentStatus === 'PAID' ? 'check-circle' : 'request-page'}
-                      size={16}
+                      size={22}
                       color={order.paymentStatus === 'PAID' ? COLOR_SUCCESS : THEME_ORANGE}
                     />
                     <Text style={[styles.secondaryActionText, order.paymentStatus === 'PAID' && { color: COLOR_SUCCESS }]}>
@@ -472,6 +462,7 @@ export default function OrderDetailsScreen() {
               <MaterialIcons name="add" size={20} color="#FFF" />
               <Text style={styles.addFirstOrderBtnText}>ADD ORDERS</Text>
             </Hoverable>
+
       </ScrollView>
     </SafeAreaView>
     </Fragment>
@@ -521,9 +512,9 @@ const styles = StyleSheet.create({
   orderSubtotalAmount:{ fontSize: 14, fontWeight: '900', color: THEME_ORANGE },
 
   orderActions: { flexDirection: 'row', gap: 6, padding: 10, paddingTop: 0 },
-  secondaryActionBtn: { flex: 1, minHeight: 34, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, borderWidth: 1, borderColor: '#BFDBFE', borderRadius: 7, paddingHorizontal: 6 },
+  secondaryActionBtn: { flex: 1, minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1.5, borderColor: '#BFDBFE', borderRadius: 10, paddingHorizontal: 12 },
   requestedActionBtn: { backgroundColor: '#EFF6FF' },
-  secondaryActionText: { color: THEME_ORANGE, fontSize: 10, fontWeight: '800' },
+  secondaryActionText: { color: THEME_ORANGE, fontSize: 16, fontWeight: '800' },
 
   notesRow:  { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingBottom: 8 },
   notesText: { fontSize: 11, color: '#64748B', fontStyle: 'italic', flex: 1 },

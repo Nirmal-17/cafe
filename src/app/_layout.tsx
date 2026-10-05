@@ -1,12 +1,16 @@
 import { Slot, DarkTheme, DefaultTheme, ThemeProvider, useRouter, usePathname } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
+// Web-only global stylesheet (ignored on native) — larger, styled scrollbars.
+import '../scrollbars.css';
 import { useColorScheme } from 'react-native';
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { AlertDialog } from '@/components/AlertDialog';
 import { BottomToast } from '@/components/BottomToast';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/services/api';
+import { BASE_URL_STORAGE_KEY } from '@/config/apiConfig';
 import { getStorageItemSync, initStorageHydration } from '@/utils/storage';
+import { loadSession } from '@/utils/sessions';
 import {
   useFonts,
   Archivo_400Regular,
@@ -20,11 +24,9 @@ SplashScreen.preventAutoHideAsync();
 
 // Keys that gate rendering — hydrated from AsyncStorage before first paint on native
 const PERSISTED_KEYS = [
-  'smart_cafe_token',
-  'smart_cafe_user',
-  'smart_cafe_base_url',
+  'smart_cafe_sessions',
+  BASE_URL_STORAGE_KEY,
   'smart_cafe_active_tab',
-  'smart_cafe_saved_username',
   'smart_cafe_active_orders',
   'smart_cafe_notifications',
   'smart_cafe_cleared_history',
@@ -54,14 +56,13 @@ export default function Layout() {
     let cancelled = false;
     const applyPersisted = () => {
       if (cancelled) return;
-      const token = getStorageItemSync('smart_cafe_token');
-      if (token) {
-        api.setToken(token);
-      }
-      const savedBaseUrl = getStorageItemSync('smart_cafe_base_url');
+      // URL first: the session (token) is looked up per server URL.
+      const savedBaseUrl = getStorageItemSync(BASE_URL_STORAGE_KEY);
       if (savedBaseUrl && savedBaseUrl.trim()) {
         api.setBaseUrl(savedBaseUrl.trim());
       }
+      const session = loadSession(api.getBaseUrl());
+      api.setToken(session?.token ?? null);
       setStorageReady(true);
     };
     // Never let a stuck AsyncStorage read hold the whole app on the splash
@@ -88,7 +89,7 @@ export default function Layout() {
 
   useEffect(() => {
     if (!storageReady) return;
-    const hasToken = Boolean(getStorageItemSync('smart_cafe_token')) || Boolean(api.getToken());
+    const hasToken = Boolean(loadSession(api.getBaseUrl())?.token) || Boolean(api.getToken());
     if (!hasToken && pathname !== '/' && pathname !== '') {
       routerRef.current.replace('/' as any);
     }

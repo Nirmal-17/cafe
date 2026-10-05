@@ -20,7 +20,7 @@ import { orderApi } from '@/services/orderApi';
 import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getGridGap } from '@/utils/responsive';
 import { webAlert } from '@/utils/webAlert';
 import { switchMainTab } from '@/utils/mainTab';
-import { executeOrderPrint } from '@/utils/print';
+import { notifyPrintProceeded } from '@/utils/printProceededToast';
 
 const THEME_ORANGE = '#FF6D00';
 const BRAND_ORANGE = '#FF6D00';
@@ -177,11 +177,12 @@ export default function PlaceOrderScreen() {
         setKitchenNotes('');
         setCounterNotes('');
         setCashierNotes('');
-        const createdOrder = response.data;
         const goToOrders = () => {
           switchMainTab('orders');
           router.dismissTo('/' as any);
         };
+        const createdOrder = response.data;
+        const tableNumberForToast = table?.tableNumber;
         webAlert('Print Bill', 'Do you want to print the bill?', [
           {
             text: 'No',
@@ -190,8 +191,8 @@ export default function PlaceOrderScreen() {
           },
           {
             text: 'Yes',
-            onPress: async () => {
-              await executeOrderPrint(createdOrder.id, createdOrder);
+            onPress: () => {
+              notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
               goToOrders();
             },
           },
@@ -311,7 +312,7 @@ export default function PlaceOrderScreen() {
         {isMenuExpanded && (
           <>
             {/* Category Chips */}
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 6 }}>
               <TouchableOpacity
                 style={[styles.chip, activeCategoryId === null && styles.chipActive]}
                 onPress={() => setActiveCategoryId(null)}
@@ -498,9 +499,9 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   countBadgeText:  { fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '800', color: THEME_ORANGE },
   arrowCircle:     { width: moderateScale(32, 0.5, bp.breakpoint), height: moderateScale(32, 0.5, bp.breakpoint), borderRadius: moderateScale(16, 0.5, bp.breakpoint), backgroundColor: '#F1F5F9', alignItems: 'center', justifyContent: 'center' },
 
-  chip:          { paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm'), borderRadius: getBorderRadius(bp.breakpoint, 'lg'), backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: BORDER_COLOR, marginRight: getSpacing(bp.breakpoint, 'sm') },
+  chip:          { paddingHorizontal: getSpacing(bp.breakpoint, 'sm'), paddingVertical: getSpacing(bp.breakpoint, 'xs'), borderRadius: getBorderRadius(bp.breakpoint, 'lg'), backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: BORDER_COLOR, marginRight: getSpacing(bp.breakpoint, 'xs') },
   chipActive:    { backgroundColor: THEME_ORANGE, borderColor: THEME_ORANGE },
-  chipText:      { fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '600', color: '#64748B' },
+  chipText:      { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '600', color: '#64748B' },
   chipTextActive:{ color: '#FFFFFF', fontWeight: '800' },
 
   gridCard: { 
@@ -508,7 +509,7 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
     borderRadius: getBorderRadius(bp.breakpoint, 'md'), 
     borderWidth: 1, 
     borderColor: BORDER_COLOR, 
-    height: getResponsiveValue({ xs: 320, sm: 340, md: 360, lg: 400, xl: 420 }, bp.breakpoint), 
+    height: getResponsiveValue({ xs: 360, sm: 380, md: 420, lg: 460, xl: 500 }, bp.breakpoint), 
     marginBottom: getSpacing(bp.breakpoint, 'md'),
     overflow: 'hidden'
   },
@@ -526,10 +527,10 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
     maxWidth: getResponsiveValue({ xs: '49%', sm: '32.5%', md: '25%', lg: '20%', xl: '16.5%' }, bp.breakpoint),
     backgroundColor: '#FFFFFF', 
     borderRadius: getBorderRadius(bp.breakpoint, 'sm'), 
-    padding: getResponsiveValue({ xs: 8, sm: 8, md: 10, lg: 12, xl: 14 }, bp.breakpoint), 
+    padding: getResponsiveValue({ xs: 6, sm: 6, md: 8, lg: 10, xl: 12 }, bp.breakpoint), 
     borderWidth: 1, 
     borderColor: BORDER_COLOR, 
-    minHeight: getResponsiveValue({ xs: 64, sm: 66, md: 70, lg: 74, xl: 78 }, bp.breakpoint), 
+    minHeight: getResponsiveValue({ xs: 54, sm: 56, md: 58, lg: 62, xl: 66 }, bp.breakpoint), 
     justifyContent: 'space-between', 
     position: 'relative',
     shadowColor: '#0F172A',
@@ -541,10 +542,10 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   menuCardSelected: { borderColor: THEME_ORANGE, backgroundColor: '#FFF3E0' },
   qtyBadge:  { position: 'absolute', top: -moderateScale(5, 0.5, bp.breakpoint), right: -moderateScale(5, 0.5, bp.breakpoint), backgroundColor: BRAND_ORANGE, borderRadius: getBorderRadius(bp.breakpoint, 'sm'), paddingHorizontal: moderateScale(6, 0.5, bp.breakpoint), paddingVertical: moderateScale(2, 0.5, bp.breakpoint), zIndex: 10 },
   qtyBadgeText:{ color: '#FFF', fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '800' },
-  menuCardName:  { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '700', color: '#0F172A', lineHeight: getResponsiveValue({ xs: 13, sm: 14, md: 15, lg: 16, xl: 18 }, bp.breakpoint) },
+  menuCardName:  { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '700', color: '#0F172A', lineHeight: getResponsiveValue({ xs: 12, sm: 13, md: 14, lg: 15, xl: 17 }, bp.breakpoint) },
   menuCardFooter:{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: getSpacing(bp.breakpoint, 'xs'), gap: 4 },
   menuCardPrice: { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '800', color: THEME_ORANGE, flexShrink: 1 },
-  addBtn:        { backgroundColor: THEME_ORANGE, width: moderateScale(26, 0.5, bp.breakpoint), height: moderateScale(26, 0.5, bp.breakpoint), borderRadius: moderateScale(13, 0.5, bp.breakpoint), alignItems: 'center', justifyContent: 'center' },
+  addBtn:        { backgroundColor: THEME_ORANGE, width: moderateScale(22, 0.5, bp.breakpoint), height: moderateScale(22, 0.5, bp.breakpoint), borderRadius: moderateScale(11, 0.5, bp.breakpoint), alignItems: 'center', justifyContent: 'center' },
 
   divider:      { height: 1, backgroundColor: BORDER_COLOR, marginVertical: getSpacing(bp.breakpoint, 'md') },
   sectionTitle: { fontSize: getFontSize(bp.breakpoint, 'lg'), fontWeight: '800', color: '#0F172A', marginBottom: getSpacing(bp.breakpoint, 'sm') },

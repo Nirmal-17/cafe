@@ -15,6 +15,7 @@
  */
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const net = require('net');
 const path = require('path');
 
@@ -132,9 +133,36 @@ function spawnTask(task) {
 
 async function main() {
   const startedAt = Date.now();
-  process.stdout.write('CafeOS dev — API :3000 + Expo Metro :8081 (Ctrl+C stops both)\n');
 
-  for (const task of TASKS) {
+  // This checkout can be frontend-only (the API living in a sibling repo or
+  // hosted). Without this guard the `api` task runs `npm --prefix backend`
+  // against a folder that isn't there, exits ENOENT and takes Expo down.
+  const hasBackend = fs.existsSync(path.join(ROOT, 'backend', 'package.json'));
+
+  // Server sign-in will hit — configured in .env (EXPO_PUBLIC_API_URL).
+  let apiUrl = 'https://cafeos.leadingedge.com.np';
+  try {
+    const match = fs.readFileSync(path.join(ROOT, '.env'), 'utf8').match(/^\s*EXPO_PUBLIC_API_URL\s*=\s*(\S+)/m);
+    if (match) apiUrl = match[1];
+  } catch {
+    // No .env file — the built-in default applies.
+  }
+
+  process.stdout.write(
+    hasBackend
+      ? 'CafeOS dev — API :3000 + Expo Metro :8081 (Ctrl+C stops both)\n'
+      : `CafeOS dev — Expo Metro :8081 (Ctrl+C stops it)   API: ${apiUrl}\n`
+  );
+
+  const tasks = TASKS.filter((task) => {
+    if (task.name === 'api' && !hasBackend) {
+      writeLine(task, 'no backend/ folder in this checkout — skipping the API task', 'stderr');
+      return false;
+    }
+    return true;
+  });
+
+  for (const task of tasks) {
     if (await isPortBusy(task.port)) {
       writeLine(task, `something is already listening on :${task.port} — reusing it`, 'stdout');
       continue;
@@ -142,13 +170,25 @@ async function main() {
     spawnTask(task);
   }
 
+  // No local API: say where sign-in goes instead of leaving it to a generic
+  // "server unreachable" on the login form.
+  if (!hasBackend) {
+    process.stdout.write(`Note: no local API in this checkout — sign-in goes to ${apiUrl}\n`);
+  }
+
   if (children.size === 0) {
-    process.stdout.write('Both servers were already running — nothing new to start.\n');
+    process.stdout.write(
+      hasBackend
+        ? 'Both servers were already running — nothing new to start.\n'
+        : 'Expo Metro already running — nothing new to start (API task was skipped, no backend/ folder).\n'
+    );
     return;
   }
 
   writeLine({ name: 'dev', color: '\x1b[32m' }, `started in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`, 'stdout');
-  process.stdout.write('Web: http://localhost:8081   API: http://localhost:3000\n');
+  process.stdout.write(
+    hasBackend ? 'Web: http://localhost:8081   API: http://localhost:3000\n' : `Web: http://localhost:8081   API: ${apiUrl}\n`
+  );
 }
 
 process.on('SIGINT', () => shutdown(0));

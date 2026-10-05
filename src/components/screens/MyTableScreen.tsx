@@ -16,14 +16,13 @@ import {
 } from '@expo/vector-icons';
 
 import { Hoverable } from '@/components/Hoverable';
+import { showBottomToast } from '@/components/BottomToast';
 import {
   Table,
   Section,
   Order,
   StaffUser,
 } from '@/services/api';
-import { homeApi } from '@/services/homeApi';
-import { webAlert } from '@/utils/webAlert';
 
 import {
   useResponsive,
@@ -85,10 +84,8 @@ interface MyTableScreenProps {
   homeLoading: boolean;
 
   onTablePress: (table: Table) => void;
-  onToggleBooked: (table: Table) => void;
+  onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onOrderDetailsPress: () => void;
-
-  togglingBookedId: number | null;
 
   onShowDrawer: () => void;
   onShowNotifications: () => void;
@@ -124,10 +121,8 @@ export function MyTableScreen({
   homeLoading,
 
   onTablePress,
-  onToggleBooked,
+  onChangeTableStatus,
   onOrderDetailsPress,
-
-  togglingBookedId,
 
   onShowDrawer,
   onShowNotifications,
@@ -153,46 +148,40 @@ export function MyTableScreen({
   // BOOKING (direct reserve — no customer details form)
   // ----------------------------------------------------------
 
-  const [bookingSubmitting, setBookingSubmitting] = useState(false);
+  // Per-table busy id: only the pressed button locks, and the parent applies
+  // the status change optimistically so the card repaints on the next frame.
+  const [bookingTableId, setBookingTableId] = useState<number | null>(null);
   // Status a table had before being booked (CLEANING tables restored on cancel)
   const preBookStatusRef = useRef<Map<number, string>>(new Map());
 
   const handleBookTable = useCallback(async (table: Table) => {
-    setBookingSubmitting(true);
+    if (bookingTableId != null) return;
+    setBookingTableId(table.id);
     try {
-      const res = await homeApi.updateTableStatus(table.id, 'RESERVED');
-      if (res.success) {
+      const ok = await onChangeTableStatus(table.id, 'RESERVED');
+      if (ok) {
         preBookStatusRef.current.set(table.id, String(table.status).toUpperCase());
-        webAlert('Success', `Table ${table.tableNumber} reserved`);
-        onRefresh();
-      } else {
-        webAlert('Error', res.error || 'Failed to book table');
+        showBottomToast({ title: `Table ${table.tableNumber} reserved`, tone: 'success' });
       }
-    } catch (_err) {
-      webAlert('Error', 'Network error');
     } finally {
-      setBookingSubmitting(false);
+      setBookingTableId(null);
     }
-  }, [onRefresh]);
+  }, [bookingTableId, onChangeTableStatus]);
 
   const handleCancelBooking = useCallback(async (table: Table) => {
-    setBookingSubmitting(true);
+    if (bookingTableId != null) return;
+    setBookingTableId(table.id);
     try {
       const restoreStatus = preBookStatusRef.current.get(table.id) ?? 'AVAILABLE';
-      const res = await homeApi.updateTableStatus(table.id, restoreStatus);
-      if (res.success) {
+      const ok = await onChangeTableStatus(table.id, restoreStatus);
+      if (ok) {
         preBookStatusRef.current.delete(table.id);
-        webAlert('Success', `Booking cancelled for table ${table.tableNumber}`);
-        onRefresh();
-      } else {
-        webAlert('Error', res.error || 'Failed to cancel booking');
+        showBottomToast({ title: `Booking cancelled for table ${table.tableNumber}`, tone: 'info' });
       }
-    } catch (_err) {
-      webAlert('Error', 'Network error');
     } finally {
-      setBookingSubmitting(false);
+      setBookingTableId(null);
     }
-  }, [onRefresh]);
+  }, [bookingTableId, onChangeTableStatus]);
 
   const handleScroll = useCallback((event: any) => {
     const y = event.nativeEvent.contentOffset.y;
@@ -642,9 +631,6 @@ export function MyTableScreen({
               status === 'RESERVED' ||
               status === 'CLEANING';
 
-            const isBookToggling =
-              togglingBookedId === table.id;
-
             return (
               <View
                 key={table.id}
@@ -838,7 +824,7 @@ export function MyTableScreen({
                         ? handleCancelBooking(table)
                         : handleBookTable(table)
                     }
-                    disabled={isBookToggling || bookingSubmitting}
+                    disabled={bookingTableId !== null}
                     hoverOpacity={0.75}
                     accessibilityRole="button"
                     accessibilityLabel={

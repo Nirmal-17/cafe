@@ -19,7 +19,7 @@ import { OrderActionList } from '@/components/dashboard/ActionQueue';
 import { FloorPlanGrid } from '@/components/dashboard/FloorPlanGrid';
 import { InsightsCard } from '@/components/dashboard/InsightsCard';
 import { TableTabsCard } from '@/components/dashboard/TableTabsCard';
-import { isBillRequestHold, subscribeBillRequestHold } from '@/utils/billRequestHold';
+import { isOpenOrder } from '@/utils/openValue';
 
 interface DashboardScreenProps {
   user: StaffUser | null;
@@ -35,6 +35,7 @@ interface DashboardScreenProps {
   onTablePress?: (table: Table) => void;
   onOrderPress?: (tableId: number) => void;
   onOrderStatusChange?: (orderId: number, status: string) => Promise<void> | void;
+  onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   unreadCount?: number;
   onShowNotifications?: () => void;
 }
@@ -55,6 +56,7 @@ export function DashboardScreen({
   onTablePress,
   onOrderPress,
   onOrderStatusChange,
+  onChangeTableStatus,
   unreadCount = 0,
   onShowNotifications,
 }: DashboardScreenProps) {
@@ -83,12 +85,12 @@ export function DashboardScreen({
   // ── Extra data: analytics + today's shift stats (own cadence, deduped) ──
   const [analytics, setAnalytics] = useState<DashboardData | null>(null);
   const [shiftStats, setShiftStats] = useState<ShiftStats | null>(null);
+  const [todayPaidTotal, setTodayPaidTotal] = useState(0);
   const [extrasLoading, setExtrasLoading] = useState(true);
   const lastExtrasAtRef = useRef(0);
 
   const loadExtras = useCallback(
     async (force = false) => {
-      if (isWaiter) return;
       const now = Date.now();
       if (!force && now - lastExtrasAtRef.current < EXTRAS_MIN_INTERVAL_MS) return;
       lastExtrasAtRef.current = now;
@@ -100,12 +102,13 @@ export function DashboardScreen({
         dayEnd.setHours(23, 59, 59, 999);
 
         const [analyticsRes, ordersRes] = await Promise.all([
-          api.getDashboardAnalytics().catch(() => ({ success: false as const })),
+          isWaiter
+            ? Promise.resolve({ success: false as const })
+            : api.getDashboardAnalytics().catch(() => ({ success: false as const })),
           api
             .getOrders({
               page: 1,
               limit: 500,
-              waiterId: isWaiter && user?.id ? user.id : undefined,
               dateFrom: dayStart.toISOString(),
               dateTo: dayEnd.toISOString(),
             })
@@ -120,18 +123,21 @@ export function DashboardScreen({
           const paid = orders.filter((o) => o.paymentStatus === 'PAID');
           const cancelled = orders.filter((o) => o.status === 'CANCELLED');
           const revenue = paid.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
-          setShiftStats({
-            orders: Math.max(0, ordersRes.data.total - cancelled.length),
-            bills: paid.length,
-            revenue,
-            avgTicket: paid.length > 0 ? Math.round(revenue / paid.length) : 0,
-          });
+          setTodayPaidTotal(revenue);
+          if (!isWaiter) {
+            setShiftStats({
+              orders: Math.max(0, ordersRes.data.total - cancelled.length),
+              bills: paid.length,
+              revenue,
+              avgTicket: paid.length > 0 ? Math.round(revenue / paid.length) : 0,
+            });
+          }
         }
       } finally {
         setExtrasLoading(false);
       }
     },
-    [isWaiter, user?.id],
+    [isWaiter],
   );
 
   useEffect(() => {
@@ -160,16 +166,7 @@ export function DashboardScreen({
     return { occupied, pendingBill, available, busyTableCount: occupied + pendingBill };
   }, [tables]);
 
-  const orderStats = useMemo(
-    () => ({
-      pending: activeOrders.filter((o) => o.status === 'PENDING' || o.status === 'CONFIRMED').length,
-      preparing: activeOrders.filter((o) => o.status === 'PREPARING').length,
-      ready: activeOrders.filter((o) => o.status === 'READY').length,
-      served: activeOrders.filter((o) => o.status === 'SERVED').length,
-      total: activeOrders.length,
-    }),
-    [activeOrders],
-  );
+  const activeOrderCount = activeOrders.length;
 
   const billRequests = useMemo(
     () =>
@@ -194,31 +191,6 @@ export function DashboardScreen({
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()),
     [activeOrders],
   );
-
-  const totalOpenValue = useMemo(
-    () =>
-      activeOrders
-        .filter((o) => o.paymentStatus !== 'PAID' && o.status !== 'CANCELLED')
-        .reduce((sum, o) => sum + Number(o.totalAmount || 0), 0),
-    [activeOrders],
-  );
-
-  const [heldOpenValue, setHeldOpenValue] = useState<number | null>(null);
-  const totalOpenValueRef = useRef(totalOpenValue);
-  useEffect(() => {
-    totalOpenValueRef.current = totalOpenValue;
-  }, [totalOpenValue]);
-
-  useEffect(() => {
-    const sync = (onHold: boolean) => {
-      if (onHold) setHeldOpenValue((prev) => prev ?? totalOpenValueRef.current);
-      else setHeldOpenValue(null);
-    };
-    sync(isBillRequestHold());
-    return subscribeBillRequestHold(sync);
-  }, []);
-
-  const displayedOpenValue = heldOpenValue ?? totalOpenValue;
 
   // ── Handlers ──
   const [servingIds, setServingIds] = useState<number[]>([]);
@@ -246,8 +218,7 @@ export function DashboardScreen({
 
   // KPI: jump straight into the order-details (bill) screen for the newest open order
   const openOrderDetails = useCallback(() => {
-    const target =
-      activeOrders.find((o) => o.paymentStatus !== 'PAID' && o.status !== 'CANCELLED') || activeOrders[0];
+    const target = activeOrders.find(isOpenOrder) || activeOrders[0];
     if (target?.tableId && onOrderPress) onOrderPress(target.tableId);
     else onNavigateToTab('orders');
   }, [activeOrders, onOrderPress, onNavigateToTab]);
@@ -268,16 +239,15 @@ export function DashboardScreen({
     {
       icon: 'receipt',
       color: COLORS.primary,
-      value: String(orderStats.total),
+      value: String(activeOrderCount),
       label: 'Active Orders',
       onPress: () => onNavigateToTab('orders'),
     },
     {
       icon: 'cash',
       color: COLORS.green,
-      value: formatMoney(displayedOpenValue),
-      label: 'Open Value',
-      onPress: () => onNavigateToTab('orders'),
+      value: formatMoney(todayPaidTotal),
+      label: "Today's Bill",
     },
     {
       icon: 'clipboard-text-outline',
@@ -349,6 +319,7 @@ export function DashboardScreen({
           activeOrders={activeOrders}
           getElapsed={getElapsedDiningTime}
           onOrderPress={openOrder}
+          onChangeTableStatus={onChangeTableStatus}
           onSeeAll={() => onNavigateToTab('home')}
         />
 
@@ -402,16 +373,6 @@ export function DashboardScreen({
           />
         )}
 
-        {/* ORDER STATUS BREAKDOWN */}
-        <SectionCard icon="chart-bar" iconColor={COLORS.primary} title="Order Status">
-          <View style={styles.statusGrid}>
-            <StatusBox label="Pending" count={orderStats.pending} color={COLORS.red} icon="clock-outline" />
-            <StatusBox label="Preparing" count={orderStats.preparing} color={COLORS.orange} icon="pot-steam" />
-            <StatusBox label="Ready" count={orderStats.ready} color={COLORS.green} icon="check-circle" />
-            <StatusBox label="Served" count={orderStats.served} color={COLORS.teal} icon="check-all" />
-          </View>
-        </SectionCard>
-
         {/* FLOOR PLAN (extra — hidden for waiters) */}
         {!isWaiter && (
           <FloorPlanGrid
@@ -420,6 +381,7 @@ export function DashboardScreen({
             isWaiter={isWaiter}
             userId={user?.id}
             getElapsed={getElapsedDiningTime}
+            onChangeTableStatus={onChangeTableStatus}
             onSeeAll={() => onNavigateToTab('home')}
           />
         )}
@@ -475,26 +437,6 @@ export function DashboardScreen({
 /* -------------------------------------------------------------------------- */
 /*                              SUB COMPONENTS                                */
 /* -------------------------------------------------------------------------- */
-
-function StatusBox({
-  label,
-  count,
-  color,
-  icon,
-}: {
-  label: string;
-  count: number;
-  color: string;
-  icon: string;
-}) {
-  return (
-    <View style={styles.statusBox}>
-      <MaterialCommunityIcons name={icon as any} size={18} color={color} />
-      <Text style={[styles.statusCount, { color }]}>{count}</Text>
-      <Text style={styles.statusLabel}>{label}</Text>
-    </View>
-  );
-}
 
 /* -------------------------------------------------------------------------- */
 /*                                   STYLES                                   */
@@ -606,31 +548,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: COLORS.primary,
     letterSpacing: 0.4,
-  },
-
-  /* Order status grid */
-  statusGrid: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  statusBox: {
-    flex: 1,
-    alignItems: 'center',
-    padding: 10,
-    backgroundColor: '#F8FAFC',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    gap: 2,
-  },
-  statusCount: {
-    fontSize: 20,
-    fontWeight: '900',
-  },
-  statusLabel: {
-    fontSize: 10,
-    color: COLORS.muted,
-    fontWeight: '600',
   },
 
   /* Quick actions */

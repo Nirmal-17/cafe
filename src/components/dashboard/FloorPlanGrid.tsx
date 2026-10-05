@@ -6,6 +6,7 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { Order, Table } from '@/services/api';
 import { useResponsive, getResponsiveValue } from '@/utils/responsive';
+import { isOpenOrder } from '@/utils/openValue';
 import { COLORS, SectionCard, TABLE_STATUS_COLORS } from './shared';
 import { Popover } from '@/components/Popover';
 import { useRouter } from 'expo-router';
@@ -18,6 +19,7 @@ interface FloorPlanGridProps {
   isWaiter: boolean;
   userId?: number;
   getElapsed: (tableId: number) => string;
+  onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
 }
 
@@ -42,6 +44,7 @@ export function FloorPlanGrid({
   isWaiter,
   userId,
   getElapsed,
+  onChangeTableStatus,
   onSeeAll,
 }: FloorPlanGridProps) {
   const { breakpoint } = useResponsive();
@@ -73,7 +76,24 @@ export function FloorPlanGrid({
     setPopoverAnchorRef(null);
   };
 
+  const ordersByTable = useMemo(() => {
+    const map = new Map<number, Order[]>();
+    activeOrders.forEach((order) => {
+      if (order.tableId === null || order.tableId === undefined) return;
+      const list = map.get(order.tableId) ?? [];
+      list.push(order);
+      map.set(order.tableId, list);
+    });
+    return map;
+  }, [activeOrders]);
+
   const handleTakeOrder = async (table: Table) => {
+    const orders = ordersByTable.get(table.id) ?? [];
+    if (orders.some(isOpenOrder)) {
+      closePopover();
+      router.push(`/order-details/${table.id}` as any);
+      return;
+    }
     closePopover();
     try {
       const res = await homeApi.startTableSession(table.id);
@@ -87,37 +107,22 @@ export function FloorPlanGrid({
     }
   };
 
-  const handleReserve = async (table: Table) => {
+  const handleFreeTable = async (table: Table) => {
     closePopover();
-    try {
-      const res = await homeApi.updateTableStatus(table.id, 'RESERVED');
-      if (res.success) {
-        // Tables will refresh via real-time events
-      } else {
-        webAlert('Error', res.error || 'Failed to reserve table');
-      }
-    } catch {
-      webAlert('Error', 'Network error');
-    }
+    // Optimistic via the parent — paints instantly, rolls back on failure.
+    await onChangeTableStatus(table.id, 'AVAILABLE');
   };
 
-  const ordersByTable = useMemo(() => {
-    const map = new Map<number, Order[]>();
-    activeOrders.forEach((order) => {
-      if (order.tableId === null || order.tableId === undefined) return;
-      const list = map.get(order.tableId) ?? [];
-      list.push(order);
-      map.set(order.tableId, list);
-    });
-    return map;
-  }, [activeOrders]);
+  const handleReserve = async (table: Table) => {
+    closePopover();
+    // Parent applies the change optimistically (instant paint) + reconciles.
+    await onChangeTableStatus(table.id, 'RESERVED');
+  };
 
   // Reserved / busy table tap → jump straight to that table's order screen
   const openTableOrder = (table: Table) => {
     const orders = ordersByTable.get(table.id) ?? [];
-    const hasOpenOrders = orders.some(
-      (o) => o.paymentStatus !== 'PAID' && o.status !== 'CANCELLED',
-    );
+    const hasOpenOrders = orders.some(isOpenOrder);
     router.push(
       (hasOpenOrders ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
     );
@@ -215,7 +220,7 @@ export function FloorPlanGrid({
                     { backgroundColor: tileBackground, borderColor: tileBorder },
                   ]}
                   onPress={() => {
-                    if (isAvailable) handleTablePress(table);
+                    if (isAvailable || reserved) handleTablePress(table);
                     else if (String(table.status).toUpperCase() !== 'CLEANING')
                       openTableOrder(table);
                   }}
@@ -317,19 +322,34 @@ export function FloorPlanGrid({
           visible={true}
           anchorRef={popoverAnchorRef}
           onClose={closePopover}
-          items={[
-            {
-              label: 'Take Order',
-              icon: 'restaurant',
-              onPress: () => handleTakeOrder(popoverTable),
-            },
-            {
-              label: 'Reserve Table',
-              icon: 'bookmark-outline',
-              onPress: () => handleReserve(popoverTable),
-              disabled: String(popoverTable.status).toUpperCase() !== 'AVAILABLE',
-            },
-          ]}
+          items={
+            popoverTable.status === 'RESERVED' || popoverTable.is_reserved === true
+              ? [
+                  {
+                    label: 'Take Order',
+                    icon: 'restaurant',
+                    onPress: () => handleTakeOrder(popoverTable),
+                  },
+                  {
+                    label: 'Free Table',
+                    icon: 'lock-open',
+                    onPress: () => handleFreeTable(popoverTable),
+                  },
+                ]
+              : [
+                  {
+                    label: 'Take Order',
+                    icon: 'restaurant',
+                    onPress: () => handleTakeOrder(popoverTable),
+                  },
+                  {
+                    label: 'Reserve Table',
+                    icon: 'bookmark-outline',
+                    onPress: () => handleReserve(popoverTable),
+                    disabled: String(popoverTable.status).toUpperCase() !== 'AVAILABLE',
+                  },
+                ]
+          }
           position="auto"
         />
       )}

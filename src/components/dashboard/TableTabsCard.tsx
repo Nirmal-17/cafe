@@ -6,6 +6,7 @@ import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { Order, Table } from '@/services/api';
 import { useResponsive, getResponsiveValue } from '@/utils/responsive';
+import { isOpenOrder, sumOpenValue } from '@/utils/openValue';
 import {
   COLORS,
   SectionCard,
@@ -24,6 +25,7 @@ interface TableTabsCardProps {
   activeOrders: Order[];
   getElapsed: (tableId: number) => string;
   onOrderPress: (order: Order) => void;
+  onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
 }
 
@@ -64,6 +66,7 @@ export function TableTabsCard({
   activeOrders,
   getElapsed,
   onOrderPress,
+  onChangeTableStatus,
   onSeeAll,
 }: TableTabsCardProps) {
   const [tab, setTab] = useState<TableTab>('ALL');
@@ -79,7 +82,31 @@ export function TableTabsCard({
     setModalTable(null);
   };
 
+  const ordersByTable = useMemo(() => {
+    const map = new Map<number, Order[]>();
+    activeOrders.forEach((order) => {
+      if (order.tableId === null || order.tableId === undefined) return;
+      const list = map.get(order.tableId) ?? [];
+      list.push(order);
+      map.set(order.tableId, list);
+    });
+    map.forEach((list) =>
+      list.sort(
+        (a, b) =>
+          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() ||
+          a.id - b.id,
+      ),
+    );
+    return map;
+  }, [activeOrders]);
+
   const handleTakeOrder = async (table: Table) => {
+    const orders = ordersByTable.get(table.id) ?? [];
+    if (orders.some(isOpenOrder)) {
+      closeModal();
+      router.push(`/order-details/${table.id}` as any);
+      return;
+    }
     closeModal();
     try {
       const res = await homeApi.startTableSession(table.id);
@@ -93,18 +120,16 @@ export function TableTabsCard({
     }
   };
 
+  const handleFreeTable = async (table: Table) => {
+    closeModal();
+    // Optimistic via the parent — paints instantly, rolls back on failure.
+    await onChangeTableStatus(table.id, 'AVAILABLE');
+  };
+
   const handleReserve = async (table: Table) => {
     closeModal();
-    try {
-      const res = await homeApi.updateTableStatus(table.id, 'RESERVED');
-      if (res.success) {
-        // Tables will refresh via real-time events
-      } else {
-        webAlert('Error', res.error || 'Failed to reserve table');
-      }
-    } catch {
-      webAlert('Error', 'Network error');
-    }
+    // Parent applies the change optimistically (instant paint) + reconciles.
+    await onChangeTableStatus(table.id, 'RESERVED');
   };
 
   // All table records — no per-user scoping (the dashboard shows system-wide state)
@@ -133,31 +158,11 @@ export function TableTabsCard({
     return visibleTables;
   }, [visibleTables, tab]);
 
-  const ordersByTable = useMemo(() => {
-    const map = new Map<number, Order[]>();
-    activeOrders.forEach((order) => {
-      if (order.tableId === null || order.tableId === undefined) return;
-      const list = map.get(order.tableId) ?? [];
-      list.push(order);
-      map.set(order.tableId, list);
-    });
-    map.forEach((list) =>
-      list.sort(
-        (a, b) =>
-          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() ||
-          a.id - b.id,
-      ),
-    );
-    return map;
-  }, [activeOrders]);
-
   // Reserved / busy table tap → jump straight to that table's order screen
   // (order details when it has open orders, place-order screen otherwise)
   const openTableOrder = (table: Table) => {
     const orders = ordersByTable.get(table.id) ?? [];
-    const hasOpenOrders = orders.some(
-      (o) => o.paymentStatus !== 'PAID' && o.status !== 'CANCELLED',
-    );
+    const hasOpenOrders = orders.some(isOpenOrder);
     router.push(
       (hasOpenOrders ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
     );
@@ -235,9 +240,7 @@ export function TableTabsCard({
             const color = TABLE_STATUS_COLORS[status] || COLORS.primary;
             const label = STATUS_LABELS[status] || status;
             const orders = ordersByTable.get(table.id) ?? [];
-            const openValue = orders
-              .filter((o) => o.paymentStatus !== 'PAID')
-              .reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+            const openValue = sumOpenValue(orders);
             const busy = status === 'OCCUPIED' || status === 'PENDING_BILL';
             const purpleTile = status === 'RESERVED' || status === 'OCCUPIED';
             const freeTile = status === 'AVAILABLE';
@@ -255,8 +258,7 @@ export function TableTabsCard({
             if (busy) footer.push(getElapsed(table.id));
             if (openValue > 0) footer.push(formatMoney(openValue));
 
-            const targetOrder =
-              orders.find((o) => o.paymentStatus !== 'PAID') ?? orders[0];
+            const targetOrder = orders.find(isOpenOrder) ?? orders[0];
 
             const isAvailable = status === 'AVAILABLE';
 
@@ -265,7 +267,7 @@ export function TableTabsCard({
                 <Hoverable
                   style={[styles.tile, { backgroundColor: tileBackground, borderColor: tileBorder }]}
                   onPress={() => {
-                    if (isAvailable) handleTablePress(table);
+                    if (isAvailable || isReservedTable(table)) handleTablePress(table);
                     else if (status !== 'CLEANING') openTableOrder(table);
                   }}
                   hoverOpacity={0.85}
@@ -375,16 +377,31 @@ export function TableTabsCard({
 
               <View style={styles.modalDivider} />
 
-              <Text style={styles.modalSectionLabel}>Other Actions:</Text>
-              <Hoverable
-                style={styles.modalReserveBtn}
-                onPress={() => handleReserve(modalTable)}
-                hoverOpacity={0.8}
-                accessibilityRole="button"
-                accessibilityLabel={`Reserve table ${modalTable.tableNumber}`}
-              >
-                <Text style={styles.modalReserveBtnText}>Reserve</Text>
-              </Hoverable>
+              {isReservedTable(modalTable) ? (
+                <Hoverable
+                  style={styles.modalFreeBtn}
+                  onPress={() => handleFreeTable(modalTable)}
+                  hoverOpacity={0.8}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Free table ${modalTable.tableNumber}`}
+                >
+                  <MaterialIcons name="lock-open" size={20} color={COLORS.white} />
+                  <Text style={styles.modalFreeBtnText}>Free Table</Text>
+                </Hoverable>
+              ) : (
+                <>
+                  <Text style={styles.modalSectionLabel}>Other Actions:</Text>
+                  <Hoverable
+                    style={styles.modalReserveBtn}
+                    onPress={() => handleReserve(modalTable)}
+                    hoverOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Reserve table ${modalTable.tableNumber}`}
+                  >
+                    <Text style={styles.modalReserveBtnText}>Reserve</Text>
+                  </Hoverable>
+                </>
+              )}
             </Pressable>
           </Pressable>
         </Modal>
@@ -591,6 +608,21 @@ const styles = StyleSheet.create({
   modalReserveBtnText: {
     color: COLORS.red,
     fontSize: 15,
+    fontWeight: '700',
+  },
+  modalFreeBtn: {
+    backgroundColor: COLORS.green,
+    height: 54,
+    borderRadius: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    paddingHorizontal: 16,
+  },
+  modalFreeBtnText: {
+    color: COLORS.white,
+    fontSize: 16,
     fontWeight: '700',
   },
 });

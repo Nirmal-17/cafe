@@ -23,10 +23,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, { FadeIn, FadeOut, SlideInLeft, SlideOutLeft } from 'react-native-reanimated';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
+import { TableTabIcon } from '@/components/TableTabIcon';
 import { api, Table, Section, Order, StaffUser } from '@/services/api';
 import { homeApi } from '@/services/homeApi';
 import { orderApi } from '@/services/orderApi';
 import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
+import { clearSession, loadSession } from '@/utils/sessions';
 import { executeOrderPrint } from '@/utils/print';
 import { webAlert } from '@/utils/webAlert';
 import { useResponsive, getResponsiveValue, getSpacing, getFontSize, getBorderRadius, getTabBarHeight, getHeaderHeight, getColumnCount, getCardWidth, getGridGap, getCardPadding, getIconSize, moderateScale } from '@/utils/responsive';
@@ -40,7 +42,11 @@ import {
 import { notifyOrderReady } from '@/utils/orderReadyToast';
 import { notifyOrderServed } from '@/utils/orderServedToast';
 import { notifyBillRequested } from '@/utils/orderBillToast';
+import { notifyPrintProceeded } from '@/utils/printProceededToast';
+import { showBottomToast } from '@/components/BottomToast';
 import { subscribeMainTabSwitch } from '@/utils/mainTab';
+import { isOpenOrder } from '@/utils/openValue';
+import { formatMoney } from '@/components/dashboard/shared';
 
 // ── Modular Screens ──
 import { LoginScreen } from '@/components/screens/LoginScreen';
@@ -67,6 +73,12 @@ const BORDER_COLOR = '#CBD5E1';    // Borders
 const TEXT_DARK = '#000000';       // Black
 const TEXT_MUTED = '#6B7280';      // Secondary Text
 
+// Live-refetch coalescing window: the first event runs immediately, later
+// events inside the window share one trailing run — nothing is ever dropped.
+const REFRESH_THROTTLE_MS = 1500;
+// How long an optimistic table change suppresses its own echo event.
+const SELF_CHANGE_TTL_MS = 4000;
+
 export default function MainAppContainer() {
   const router = useRouter();
   const { width, height, breakpoint, isTablet, isDesktop } = useResponsive();
@@ -79,21 +91,20 @@ export default function MainAppContainer() {
   }, []);
 
   // ── Auth State ──
+  // The active session belongs to the configured server URL: each URL keeps its
+  // own token/user, so switching servers switches (or drops) the login.
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
-    const token = getStorageItemSync('smart_cafe_token');
-    if (token) {
-      api.setToken(token);
+    const session = loadSession(api.getBaseUrl());
+    if (session) {
+      api.setToken(session.token);
       return true;
     }
     return false;
   });
 
   const [user, setUser] = useState<StaffUser | null>(() => {
-    const savedUser = getStorageItemSync('smart_cafe_user');
-    if (savedUser) {
-      try { return JSON.parse(savedUser); } catch { return null; }
-    }
-    return null;
+    const session = loadSession(api.getBaseUrl());
+    return (session?.user as StaffUser | undefined) ?? null;
   });
 
   // ── Tab State ──
@@ -166,6 +177,7 @@ export default function MainAppContainer() {
   // ── Global Modals & Overlay States ──
   const [showServerUrlModal, setShowServerUrlModal] = useState(false);
   const [serverUrlInput, setServerUrlInput] = useState<string>(() => api.getBaseUrl());
+  const [serverUrlError, setServerUrlError] = useState('');
 
 
   // ── Tables & Sections States ──
@@ -185,10 +197,11 @@ export default function MainAppContainer() {
 
   const [selectedTableForModal, setSelectedTableForModal] = useState<Table | null>(null);
   const [startingService, setStartingService] = useState(false);
-  const [togglingBookedId, setTogglingBookedId] = useState<number | null>(null);
+  const [updatingTableStatus, setUpdatingTableStatus] = useState(false);
 
   // ── Active Orders States ──
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
+  const [todayBill, setTodayBill] = useState<number>(0);
   const [ordersSearchQuery, setOrdersSearchQuery] = useState('');
   const [orderStatusFilter, setOrderStatusFilter] = useState<'ALL' | 'SERVED'>('ALL');
 
@@ -275,8 +288,8 @@ export default function MainAppContainer() {
   // Force local logout when the JWT is missing/expired/invalid (401/403).
   // Does not call the server (the token is already rejected there).
   const forceSessionExpiry = useCallback((reason: string) => {
-    removeStorageItemSync('smart_cafe_token');
-    removeStorageItemSync('smart_cafe_user');
+    const hadToken = Boolean(api.getToken());
+    clearSession(api.getBaseUrl());
     removeStorageItemSync('smart_cafe_active_tab');
     clearCachedNotifications();
     setNotificationsList([]);
@@ -286,8 +299,50 @@ export default function MainAppContainer() {
     setUser(null);
     setIsLoggedIn(false);
     setActiveTab('dashboard');
+    // No token left (the server URL was just switched) — the login screen is
+    // already showing, a "Session Expired" dialog would only be noise.
+    if (!hadToken) return;
     webAlert('Session Expired', reason, [{ text: 'Sign In Again' }]);
   }, []);
+
+  // ── Today's Bill — same math as the dashboard KPI: Σ totalAmount of today's
+  // PAID orders, so every settlement (bill request or checkout) is recorded.
+  const lastTodayBillAtRef = useRef(0);
+  const fetchTodayBill = useCallback(async () => {
+    if (!isLoggedIn) return;
+    const now = Date.now();
+    if (now - lastTodayBillAtRef.current < 3000) return;
+    lastTodayBillAtRef.current = now;
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date();
+    dayEnd.setHours(23, 59, 59, 999);
+    try {
+      const res = await api.getOrders({
+        page: 1,
+        limit: 500,
+        dateFrom: dayStart.toISOString(),
+        dateTo: dayEnd.toISOString(),
+      });
+      if (res.success && res.data) {
+        const revenue = res.data.orders
+          .filter((o) => o.paymentStatus === 'PAID')
+          .reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+        setTodayBill(revenue);
+      } else if (res.status === 401 || res.status === 403) {
+        forceSessionExpiry('Your session is no longer valid. Please sign in again.');
+      }
+    } catch {
+      // Server unreachable — keep the last known total.
+    }
+  }, [isLoggedIn, forceSessionExpiry]);
+
+  // Recompute whenever active orders change (bill requests, payments, polls).
+  useEffect(() => {
+    queueMicrotask(() => {
+      fetchTodayBill();
+    });
+  }, [fetchTodayBill, activeOrders]);
 
   const fetchData = useCallback(async () => {
     if (!isLoggedIn) return;
@@ -323,17 +378,13 @@ export default function MainAppContainer() {
 
       if (realFailures.length > 0) {
         const first = realFailures[0] as { error?: string; status?: number };
-        if (first.status === 0) {
-          setHomeError(
-            api.isOfflineSession()
-              ? `Offline demo mode — no backend at ${api.getBaseUrl()}`
-              : `Cannot reach server at ${api.getBaseUrl()} — check connection or server URL`,
-          );
-        } else {
-          setHomeError(first.error || 'Server unreachable — check connection or server URL');
-        }
+        setHomeError(
+          first.status === 0
+            ? `Cannot reach server at ${api.getBaseUrl()} — check connection or server URL`
+            : first.error || 'Server unreachable — check connection or server URL',
+        );
       } else {
-        setHomeError(api.isOfflineSession() ? `Offline demo mode - no backend at ${api.getBaseUrl()}` : '');
+        setHomeError('');
       }
       refreshNotifications().catch(() => {});
     } catch (_err) {
@@ -348,6 +399,80 @@ export default function MainAppContainer() {
     }
   }, [isLoggedIn, refreshNotifications, forceSessionExpiry]);
 
+  // ── Table status changes (reserve / free / mark bill) ──
+  // Optimistic: flip the local snapshot immediately so the press paints on the
+  // next frame, then confirm with the server and either reconcile or roll back.
+  const patchTableStatus = useCallback((tableId: number, status: string) => {
+    const next = String(status).toUpperCase() as Table['status'];
+    const patch = { status: next, is_reserved: next === 'RESERVED' };
+    setTables((prev) => prev.map((t) => (t.id === tableId ? { ...t, ...patch } : t)));
+    setSelectedTableForModal((prev) =>
+      prev && prev.id === tableId ? { ...prev, ...patch } : prev,
+    );
+  }, []);
+
+  // Tables-only refetch — cheap reconciliation after an optimistic change.
+  const refreshTables = useCallback(async () => {
+    const res = await homeApi.getTables();
+    if (res.success && res.data) {
+      setTables(res.data);
+    } else if (res.status === 401 || res.status === 403) {
+      forceSessionExpiry('Your session is no longer valid. Please sign in again.');
+    }
+  }, [forceSessionExpiry]);
+
+  // Optimistic changes are confirmed by the PATCH response itself, so the
+  // server's own `table.status` echo is a redundant refetch — skip it.
+  const selfTableChangesRef = useRef<Map<string, number>>(new Map());
+  const markSelfTableChange = useCallback((tableId: number, status: string) => {
+    const map = selfTableChangesRef.current;
+    map.set(`${tableId}:${String(status).toUpperCase()}`, Date.now());
+    if (map.size > 50) {
+      const cutoff = Date.now() - SELF_CHANGE_TTL_MS;
+      for (const [key, at] of map) if (at < cutoff) map.delete(key);
+    }
+  }, []);
+  const consumeSelfTableChange = useCallback((tableId: unknown, status: unknown) => {
+    if (tableId == null || !status) return false;
+    const key = `${tableId}:${String(status).toUpperCase()}`;
+    const at = selfTableChangesRef.current.get(key);
+    if (at && Date.now() - at < SELF_CHANGE_TTL_MS) {
+      selfTableChangesRef.current.delete(key);
+      return true;
+    }
+    return false;
+  }, []);
+  const clearSelfTableChange = useCallback((tableId: number, status: string) => {
+    selfTableChangesRef.current.delete(`${tableId}:${String(status).toUpperCase()}`);
+  }, []);
+
+  const changeTableStatus = useCallback(
+    async (tableId: number, status: string): Promise<boolean> => {
+      const before = tablesRef.current.find((t) => t.id === tableId);
+      patchTableStatus(tableId, status);
+      // Mark before awaiting: the server's echo can beat the PATCH response.
+      markSelfTableChange(tableId, status);
+      const res = await homeApi.updateTableStatus(tableId, status);
+      if (res.success && res.data) {
+        const server = res.data;
+        setTables((prev) => prev.map((t) => (t.id === tableId ? { ...t, ...server } : t)));
+        setSelectedTableForModal((prev) =>
+          prev && prev.id === tableId ? { ...prev, ...server } : prev,
+        );
+        return true;
+      }
+      clearSelfTableChange(tableId, status);
+      if (before) patchTableStatus(tableId, before.status);
+      if (res.status === 401 || res.status === 403) {
+        forceSessionExpiry('Your session is no longer valid. Please sign in again.');
+        return false;
+      }
+      webAlert('Error', res.error || 'Failed to update table status');
+      return false;
+    },
+    [patchTableStatus, markSelfTableChange, clearSelfTableChange, forceSessionExpiry],
+  );
+
   // ── Live updates: WebSocket events trigger a throttled refetch (all platforms).
   useEffect(() => {
     if (!isLoggedIn) return;
@@ -356,32 +481,27 @@ export default function MainAppContainer() {
       fetchData();
     });
 
-    let lastFetchAt = 0;
-    const THROTTLE_MS = 3000;
-    const throttledFetch = () => {
-      const now = Date.now();
-      if (now - lastFetchAt < THROTTLE_MS) return;
-      lastFetchAt = now;
-      fetchData();
-    };
-
-    // Selective refetch based on event type — avoids refetching everything for every event
-    let lastSelectiveAt = 0;
-    const throttledSelective = (fn: () => Promise<void>) => {
-      const now = Date.now();
-      if (now - lastSelectiveAt < THROTTLE_MS) return;
-      lastSelectiveAt = now;
-      fn();
-    };
-
-    const fetchTablesOnly = async () => {
-      const res = await homeApi.getTables();
-      if (!res.success && (res.status === 401 || res.status === 403)) {
-        forceSessionExpiry('Your session is no longer valid. Please sign in again.');
+    // Coalescing scheduler: keyed, trailing-edge. The first call for a key runs
+    // on the next tick; calls inside the window are merged into that pending run
+    // (the old drop-throttle silently discarded them until the 30s heartbeat).
+    const timers = new Map<string, { handle: ReturnType<typeof setTimeout>; fn: () => void | Promise<void> }>();
+    const lastRunAt = new Map<string, number>();
+    const schedule = (key: string, fn: () => void | Promise<void>) => {
+      const pending = timers.get(key);
+      if (pending) {
+        pending.fn = fn; // already scheduled — keep the deadline, take the newest work
         return;
       }
-      if (res.success && res.data) setTables(res.data);
+      const wait = Math.max(0, REFRESH_THROTTLE_MS - (Date.now() - (lastRunAt.get(key) ?? 0)));
+      const handle = setTimeout(() => {
+        timers.delete(key);
+        lastRunAt.set(key, Date.now());
+        fn();
+      }, wait);
+      timers.set(key, { handle, fn });
     };
+
+    const fetchTablesOnly = refreshTables;
 
     const fetchActiveOrdersOnly = async () => {
       const res = await orderApi.getActiveOrders('active-orders-selective');
@@ -394,25 +514,30 @@ export default function MainAppContainer() {
       }
     };
 
+    const refetchOrdersAndTables = () =>
+      Promise.all([fetchActiveOrdersOnly(), fetchTablesOnly()]).then(() => {});
+
     // Real-time events: event-driven with selective refetch
     const unsubscribe = api.subscribeToEvents((event) => {
       const type = event?.type;
       if (!type) {
-        throttledFetch();
+        schedule('all', fetchData);
         return;
       }
       switch (type) {
         case 'table.status':
-        case 'table.session':
-          throttledSelective(fetchTablesOnly);
+        case 'table.session': {
+          // Our own optimistic free/reserve already reconciled from the PATCH
+          // response — skipping this echo saves a full GET /tables per action.
+          const p = event.payload ?? {};
+          if (type === 'table.status' && consumeSelfTableChange(p.tableId, p.status)) break;
+          schedule('tables', fetchTablesOnly);
           break;
+        }
         case 'order.created':
         case 'order.paid':
         case 'order.cancelled':
-          throttledSelective(async () => {
-            await fetchActiveOrdersOnly();
-            await fetchTablesOnly();
-          });
+          schedule('orders+tables', refetchOrdersAndTables);
           break;
         case 'order.status':
           if (event.payload?.status === 'READY') {
@@ -424,10 +549,7 @@ export default function MainAppContainer() {
           if (event.payload?.billRequested === true) {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
           }
-          throttledSelective(async () => {
-            await fetchActiveOrdersOnly();
-            await fetchTablesOnly();
-          });
+          schedule('orders+tables', refetchOrdersAndTables);
           break;
         case 'notification.created':
           if (event.payload?.type === 'order_ready') {
@@ -439,10 +561,10 @@ export default function MainAppContainer() {
           if (event.payload?.type === 'bill_requested') {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
           }
-          throttledSelective(refreshNotifications);
+          schedule('notifications', refreshNotifications);
           break;
         default:
-          throttledFetch();
+          schedule('all', fetchData);
           break;
       }
     });
@@ -456,9 +578,11 @@ export default function MainAppContainer() {
     return () => {
       unsubscribe();
       clearInterval(intervalId);
+      timers.forEach((t) => clearTimeout(t.handle));
+      timers.clear();
       api.abortAllRequests();
     };
-  }, [isLoggedIn, fetchData, refreshNotifications, forceSessionExpiry, notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable]);
+  }, [isLoggedIn, fetchData, refreshTables, refreshNotifications, forceSessionExpiry, consumeSelfTableChange, notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -466,6 +590,30 @@ export default function MainAppContainer() {
   }, [fetchData]);
 
   // ── Event Handlers ──
+  // Switching the backend URL adopts that URL's own session (every server keeps
+  // its own login) and drops all state belonging to the previous server.
+  const applyServerUrl = useCallback((url: string) => {
+    fetchGenerationRef.current++;
+    const session = loadSession(url);
+    api.setToken(session?.token ?? null);
+    setUser((session?.user as StaffUser | undefined) ?? null);
+    setIsLoggedIn(Boolean(session));
+    setActiveTab('dashboard');
+    setSections([]);
+    setTables([]);
+    setActiveOrders([]);
+    setTodayBill(0);
+    clearCachedNotifications();
+    setNotificationsList([]);
+    setUnreadCount(0);
+    removeStorageItemSync('smart_cafe_cleared_history');
+    setHomeError('');
+    setHomeLoading(true);
+    if (session) {
+      fetchData();
+    }
+  }, [fetchData]);
+
   const handleLoginSuccess = (loggedUser: StaffUser) => {
     setUser(loggedUser);
     setIsLoggedIn(true);
@@ -473,18 +621,18 @@ export default function MainAppContainer() {
     fetchData();
   };
 
-  const performLogout = async () => {
-    removeStorageItemSync('smart_cafe_token');
-    removeStorageItemSync('smart_cafe_user');
+  const performLogout = () => {
+    clearSession(api.getBaseUrl());
     removeStorageItemSync('smart_cafe_active_tab');
     clearCachedNotifications();
     setNotificationsList([]);
     setUnreadCount(0);
-    api.abortAllRequests();
-    await api.logout();
     setUser(null);
     setIsLoggedIn(false);
     setActiveTab('dashboard');
+    api.abortAllRequests();
+    // Best-effort server logout — never gates the UI transition.
+    api.logout().catch(() => {});
   };
 
   const handleLogout = () => {
@@ -538,42 +686,29 @@ export default function MainAppContainer() {
     }
   };
 
-  const handleUpdateModalTableStatus = async (newStatus: string) => {
+  // RESERVED table popup → "Take Order". Jump straight to order details when the
+  // table already has an open order, otherwise open a dining session first.
+  const handleReservedTakeOrder = () => {
     if (!selectedTableForModal) return;
     const tableId = selectedTableForModal.id;
-    try {
-      const res = await homeApi.updateTableStatus(tableId, newStatus);
-      if (res.success) {
-        setSelectedTableForModal(null);
-        fetchData();
-      } else {
-        webAlert('Error', res.error || 'Failed to update status');
-      }
-    } catch (_err) {
-      webAlert('Error', 'Network error');
+    const hasOpenOrders = activeOrders.some((o) => o.tableId === tableId && isOpenOrder(o));
+    if (hasOpenOrders) {
+      setSelectedTableForModal(null);
+      router.push(`/order-details/${tableId}` as any);
+      return;
     }
+    handleConfirmStartService();
   };
 
-  // Toggle booked (RESERVED) vs not booked (AVAILABLE) straight from a home-screen card
-  const handleToggleBooked = async (table: Table) => {
-    if (togglingBookedId != null) return;
-    const status = String(table.status).toUpperCase();
-    const isReserved = status === 'RESERVED' || table.is_reserved === true;
-    const isAvailable =
-      status === 'AVAILABLE' || status === 'CLEANING';
-    if (!isReserved && !isAvailable) return;
-    setTogglingBookedId(table.id);
+  const handleUpdateModalTableStatus = async (newStatus: string) => {
+    if (!selectedTableForModal || updatingTableStatus) return;
+    const tableId = selectedTableForModal.id;
+    setSelectedTableForModal(null);
+    setUpdatingTableStatus(true);
     try {
-      const res = await homeApi.updateTableStatus(table.id, isReserved ? 'AVAILABLE' : 'RESERVED');
-      if (res.success) {
-        fetchData();
-      } else {
-        webAlert('Error', res.error || 'Failed to update booking');
-      }
-    } catch (_err) {
-      webAlert('Error', 'Network error');
+      await changeTableStatus(tableId, newStatus);
     } finally {
-      setTogglingBookedId(null);
+      setUpdatingTableStatus(false);
     }
   };
 
@@ -595,12 +730,20 @@ export default function MainAppContainer() {
       const order = activeOrders.find(o => o.id === orderId);
       const success = await executeOrderPrint(orderId, order);
       if (success) {
-        webAlert('Printing', 'Receipt sent to printer!');
+        notifyPrintProceeded(orderId, tableNumberForOrder(orderId) || order?.table?.tableNumber);
       } else {
-        webAlert('Notice', 'Print dialog displayed or sent to print queue.');
+        showBottomToast({
+          title: 'Printing',
+          message: 'Print dialog displayed or sent to print queue.',
+          tone: 'info',
+        });
       }
     } catch (_err) {
-      webAlert('Error', 'Failed to connect to printer.');
+      showBottomToast({
+        title: 'Print Failed',
+        message: 'Failed to connect to printer.',
+        tone: 'error',
+      });
     }
   };
 
@@ -669,8 +812,8 @@ export default function MainAppContainer() {
                     resizeMode="cover"
                   />
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.darkDrawerUserName}>{user?.name || 'Sajan'}</Text>
-                    <Text style={styles.darkDrawerUserRole}>{user?.role || 'Waiter'}</Text>
+                    <Text style={styles.darkDrawerUserName}>{user?.name || 'Staff'}</Text>
+                    <Text style={styles.darkDrawerUserRole}>{user?.role || 'Staff'}</Text>
                   </View>
                   <MaterialIcons name="chevron-right" size={20} color="#6B7280" />
                 </>
@@ -861,6 +1004,7 @@ export default function MainAppContainer() {
             onTablePress={handleTablePress}
             onOrderPress={(tableId) => router.push(`/order-details/${tableId}` as any)}
             onOrderStatusChange={handleOrderStatusChange}
+            onChangeTableStatus={changeTableStatus}
             unreadCount={unreadCount}
             onShowNotifications={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('notifications'); }}
           />
@@ -883,9 +1027,8 @@ export default function MainAppContainer() {
             activeOrders={activeOrders}
             homeLoading={homeLoading}
             onTablePress={handleTablePress}
-            onToggleBooked={handleToggleBooked}
+            onChangeTableStatus={changeTableStatus}
             onOrderDetailsPress={handleOrderDetailsPress}
-            togglingBookedId={togglingBookedId}
             onShowDrawer={openDrawer}
             onShowNotifications={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('notifications'); }}
             onNavigateProfile={() => setActiveTab('profile')}
@@ -908,6 +1051,7 @@ export default function MainAppContainer() {
             onShowDrawer={openDrawer}
             onOrderPress={(tableId) => router.push(`/order-details/${tableId}` as any)}
             onOrderStatusChange={handleOrderStatusChange}
+            onBookTable={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('home'); }}
           />
         </Animated.View>
       )}
@@ -991,15 +1135,15 @@ export default function MainAppContainer() {
                     <MaterialCommunityIcons name="receipt-text-outline" size={16} color={BRAND_ORANGE} />
                     <Text style={styles.metricLabel}>Open Orders</Text>
                     <Text style={styles.metricValue}>
-                      {activeOrders.length}
+                      {activeOrders.filter(isOpenOrder).length}
                     </Text>
                   </View>
                   <View style={styles.metricDivider} />
                   <View style={styles.metricItem}>
                     <MaterialCommunityIcons name="cash-multiple" size={16} color={COLOR_SUCCESS} />
-                    <Text style={styles.metricLabel}>Open Value</Text>
+                    <Text style={styles.metricLabel}>{"Today's Bill"}</Text>
                     <Text style={[styles.metricValue, styles.metricValueRevenue]}>
-                      Rs. {activeOrders.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0).toLocaleString()}
+                      {formatMoney(todayBill)}
                     </Text>
                   </View>
                 </View>
@@ -1027,7 +1171,7 @@ export default function MainAppContainer() {
 
               <Hoverable
                 style={styles.actionListItem}
-                onPress={() => { setServerUrlInput(api.getBaseUrl()); setShowServerUrlModal(true); }}
+                onPress={() => { setServerUrlInput(api.getBaseUrl()); setServerUrlError(''); setShowServerUrlModal(true); }}
                 hoverOpacity={0.8}
               >
                 <View style={styles.actionListLeft}>
@@ -1075,11 +1219,11 @@ export default function MainAppContainer() {
               </TouchableOpacity>
             </View>
             <Text style={styles.modalSubtitle}>Address of the CafeOS backend. Include http:// and port (e.g. http://192.168.1.10:3000).</Text>
-            <View style={{ backgroundColor: '#F8FAFC', borderRadius: 12, borderWidth: 1, borderColor: BORDER_COLOR, marginBottom: 12 }}>
+            <View style={{ backgroundColor: '#F8FAFC', borderRadius: 12, borderWidth: 1, borderColor: serverUrlError ? COLOR_ERROR : BORDER_COLOR, marginBottom: serverUrlError ? 6 : 12 }}>
               <TextInput
                 style={{ paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: TEXT_DARK, minHeight: 44 }}
                 value={serverUrlInput}
-                onChangeText={setServerUrlInput}
+                onChangeText={(text) => { setServerUrlInput(text); setServerUrlError(''); }}
                 placeholder="http://localhost:3000"
                 placeholderTextColor={TEXT_MUTED}
                 autoCapitalize="none"
@@ -1087,14 +1231,29 @@ export default function MainAppContainer() {
                 keyboardType="url"
               />
             </View>
+            {serverUrlError ? (
+              <Text style={{ fontSize: 12, color: COLOR_ERROR, fontWeight: '600', marginBottom: 12 }}>{serverUrlError}</Text>
+            ) : null}
             <View style={{ flexDirection: 'row', gap: 8 }}>
               <Hoverable
                 style={[styles.btnSecondary, { flex: 1 }]}
                 onPress={() => {
+                  const previous = api.getBaseUrl();
                   const url = api.resetBaseUrl();
+                  const changed = url !== previous;
                   setServerUrlInput(url);
+                  setServerUrlError('');
                   setShowServerUrlModal(false);
-                  fetchData();
+                  // Only drop caches/session state when the URL actually moved —
+                  // a no-op reset must not wipe the current screen.
+                  if (changed) applyServerUrl(url);
+                  showBottomToast({
+                    title: changed ? 'Server URL reset' : 'Already on the default server',
+                    message: changed
+                      ? `Now using ${url}`
+                      : `${url} is the default — edit the field to point elsewhere.`,
+                    tone: changed ? 'success' : 'info',
+                  });
                 }}
                 hoverOpacity={0.8}
               >
@@ -1103,10 +1262,18 @@ export default function MainAppContainer() {
               <Hoverable
                 style={[styles.btnPrimary, { flex: 1 }]}
                 onPress={() => {
+                  // Reject malformed URLs up front — the current server stays
+                  // active and the reason is shown under the input.
+                  const check = api.validateBaseUrl(serverUrlInput);
+                  if (!check.ok) {
+                    setServerUrlError(check.error || 'Invalid server URL');
+                    return;
+                  }
                   const saved = api.setBaseUrl(serverUrlInput);
                   setServerUrlInput(saved);
+                  setServerUrlError('');
                   setShowServerUrlModal(false);
-                  fetchData();
+                  applyServerUrl(saved);
                 }}
                 hoverOpacity={0.8}
               >
@@ -1147,12 +1314,33 @@ export default function MainAppContainer() {
                     </Hoverable>
                   </View>
                 </View>
+              ) : selectedTableForModal.status === 'RESERVED' || selectedTableForModal.is_reserved === true ? (
+                <View style={{ gap: 12 }}>
+                  <View style={styles.occupiedSummary}>
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Status</Text>
+                      <Text style={{ fontSize: 14, fontWeight: '800', color: COLOR_ERROR, marginTop: 2 }}>Reserved</Text>
+                    </View>
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Seats</Text>
+                      <Text style={{ fontSize: 14, fontWeight: '800', color: TEXT_DARK, marginTop: 2 }}>{selectedTableForModal.capacity} seats</Text>
+                    </View>
+                  </View>
+                  <Hoverable style={[styles.btnPrimary, startingService && { opacity: 0.6 }]} onPress={handleReservedTakeOrder} disabled={startingService} hoverOpacity={0.8}>
+                    <MaterialIcons name="restaurant" size={20} color={BG_WHITE} />
+                    <Text style={styles.btnPrimaryText}>{startingService ? 'Taking…' : 'Take Order'}</Text>
+                  </Hoverable>
+                  <Hoverable style={[styles.btnPrimary, { backgroundColor: COLOR_SUCCESS }]} onPress={() => handleUpdateModalTableStatus('AVAILABLE')} hoverOpacity={0.8}>
+                    <MaterialIcons name="lock-open" size={20} color={BG_WHITE} />
+                    <Text style={styles.btnPrimaryText}>Free Table</Text>
+                  </Hoverable>
+                </View>
               ) : (
                 <View style={{ gap: 12 }}>
                   <View style={styles.occupiedSummary}>
                     <View style={{ alignItems: 'center' }}>
                       <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Status</Text>
-                      <Text style={{ fontSize: 14, fontWeight: '800', color: selectedTableForModal.status === 'RESERVED' ? COLOR_ERROR : BRAND_ORANGE, marginTop: 2 }}>{selectedTableForModal.status === 'RESERVED' ? 'Reserved' : 'Occupied'}</Text>
+                      <Text style={{ fontSize: 14, fontWeight: '800', color: BRAND_ORANGE, marginTop: 2 }}>Occupied</Text>
                     </View>
                     <View style={{ alignItems: 'center' }}>
                       <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Time</Text>
@@ -1190,7 +1378,7 @@ export default function MainAppContainer() {
         )}
         {visibleTabs.includes('home') && (
           <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('home'); }} hoverOpacity={0.7}>
-            <MaterialCommunityIcons name="table-large" size={activeTab === 'home' ? 28 : 24} color={activeTab === 'home' ? BRAND_PRIMARY : TEXT_MUTED} />
+            <TableTabIcon active={activeTab === 'home'} size={activeTab === 'home' ? 28 : 24} color={activeTab === 'home' ? BRAND_PRIMARY : TEXT_MUTED} />
             <Text style={[styles.tabBtnText, activeTab === 'home' && styles.tabBtnTextActive]}>My Tables</Text>
           </Hoverable>
         )}
@@ -1387,8 +1575,8 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   modalBadge: { backgroundColor: BRAND_PRIMARY, borderRadius: getBorderRadius(bp.breakpoint, 'full'), paddingHorizontal: getSpacing(bp.breakpoint, 'sm'), paddingVertical: getSpacing(bp.breakpoint, 'xs'), justifyContent: 'center', alignItems: 'center', minWidth: moderateScale(20, 0.5, bp.breakpoint), marginLeft: getSpacing(bp.breakpoint, 'xs') },
   modalBadgeText: { color: '#FFFFFF', fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '800' },
   bottomTabBar: { flexDirection: 'row', height: getTabBarHeight(bp.breakpoint), marginHorizontal: getSpacing(bp.breakpoint, 'md'), marginBottom: getSpacing(bp.breakpoint, 'sm'), borderRadius: getBorderRadius(bp.breakpoint, 'xl'), backgroundColor: BG_WHITE, alignItems: 'center', justifyContent: 'space-around', borderWidth: 1, borderColor: BORDER_COLOR, elevation: 8, shadowColor: BRAND_PRIMARY, shadowOffset: { width: 0, height: 5 }, shadowOpacity: 0.1, shadowRadius: 16 },
-  tabBtn: { flex: 1, alignItems: 'center', justifyContent: 'center', height: '100%', borderRadius: getBorderRadius(bp.breakpoint, 'lg') },
-  tabBtnText: { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '600', color: TEXT_MUTED, marginTop: getSpacing(bp.breakpoint, 'xs') },
+  tabBtn: { flex: 1, flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', borderRadius: getBorderRadius(bp.breakpoint, 'lg'), gap: 2 },
+  tabBtnText: { fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '600', color: TEXT_MUTED },
   tabBtnTextActive: { color: BRAND_PRIMARY, fontWeight: '800' },
   tabProfileAvatar: { width: moderateScale(26, 0.5, bp.breakpoint), height: moderateScale(26, 0.5, bp.breakpoint), borderRadius: moderateScale(13, 0.5, bp.breakpoint), borderWidth: 1, borderColor: BORDER_COLOR, backgroundColor: BG_WHITE },
   tabProfileAvatarActive: { width: moderateScale(30, 0.5, bp.breakpoint), height: moderateScale(30, 0.5, bp.breakpoint), borderRadius: moderateScale(15, 0.5, bp.breakpoint), borderWidth: 2, borderColor: BRAND_PRIMARY },

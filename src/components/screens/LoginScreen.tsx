@@ -15,7 +15,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { api, StaffUser } from '@/services/api';
-import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
+import { loadSession, saveSession, savedUsername } from '@/utils/sessions';
+import { describeLoopbackIssue } from '@/config/apiConfig';
 
 const COLORS = {
   panel: '#3F3D77',
@@ -38,7 +39,7 @@ interface LoginScreenProps {
 }
 
 export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
-  const [username, setUsername] = useState(() => getStorageItemSync('smart_cafe_saved_username') || '');
+  const [username, setUsername] = useState(() => savedUsername(api.getBaseUrl()));
   const [password, setPassword] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState('');
@@ -46,49 +47,169 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [showPassword, setShowPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [serverOffline, setServerOffline] = useState(false);
-  const [showServerUrl, setShowServerUrl] = useState(false);
+  // Result of the last failed probe: the URL it targeted plus the opposite
+  // scheme that answered (https:// typed against a plain-HTTP backend, or the
+  // reverse). Offered only while it still matches the URL in the field.
+  const [schemeProbe, setSchemeProbe] = useState<{ url: string; alternate: string } | null>(null);
   const [serverUrlInput, setServerUrlInput] = useState(() => api.getBaseUrl());
-  const logoTapCountRef = useRef(0);
-  const lastLogoTapRef = useRef(0);
+  // The SERVER URL card is a hidden admin control: it only appears after the
+  // brand logo is triple-tapped (toggle back with another triple-tap).
+  const [showServerUrl, setShowServerUrl] = useState(false);
+  const logoTapTimesRef = useRef<number[]>([]);
+  // Once the user types a username, switching servers must not overwrite it.
+  const usernameTouchedRef = useRef(false);
 
-  const checkServer = async () => {
-    const res = await api.pingHealth();
-    setServerOffline(res === null);
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-    api.pingHealth().then((res) => {
-      if (!cancelled) setServerOffline(res === null);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Hidden dev menu: triple-tap the brand logo to reveal the server URL box.
-  // Counted on press-*start* (onPressIn) rather than onPress: on web the click
-  // behind onPress is dropped whenever a text selection or image drag cancels
-  // it, which is exactly what happens on the 2nd/3rd tap of a triple-tap.
-  const handleLogoTap = () => {
+  const handleLogoTripleTap = () => {
     const now = Date.now();
-    if (now - lastLogoTapRef.current > 2500) {
-      logoTapCountRef.current = 0;
-    }
-    lastLogoTapRef.current = now;
-    logoTapCountRef.current += 1;
-    if (logoTapCountRef.current >= 3) {
-      logoTapCountRef.current = 0;
-      setServerUrlInput(api.getBaseUrl());
-      setShowServerUrl((visible) => !visible);
+    const recent = logoTapTimesRef.current.filter((t) => now - t < 700);
+    recent.push(now);
+    logoTapTimesRef.current = recent;
+    if (recent.length >= 3) {
+      logoTapTimesRef.current = [];
+      setShowServerUrl((v) => !v);
     }
   };
+
+  // On a phone/emulator "localhost" is the device itself — the backend runs on
+  // the computer, so spell out the reachable address instead of a bare
+  // "server unreachable". Null on web and whenever the URL is not loopback.
+  // Normalized first: a bare "localhost:3000" has no scheme, and the loopback
+  // check only matches scheme-qualified URLs.
+  const normalizedServerUrl = (() => {
+    const check = api.validateBaseUrl(serverUrlInput);
+    return check.ok ? check.url : api.normalizeUrl(serverUrlInput);
+  })();
+  const loopbackHint = describeLoopbackIssue(normalizedServerUrl);
+
+  // Derived instead of cleared in an effect: a "switch to X" hint belongs to
+  // the URL it was probed for and disappears the moment the field moves on.
+  const probeTarget = api.validateBaseUrl(serverUrlInput.trim());
+  const schemeSuggestion =
+    probeTarget.ok && schemeProbe && schemeProbe.url === probeTarget.url ? schemeProbe.alternate : null;
 
   const handleSaveServerUrl = () => {
+    const check = api.validateBaseUrl(serverUrlInput);
+    if (!check.ok) {
+      setNotice('');
+      setAuthError(check.error || 'Invalid server URL');
+      return;
+    }
     const saved = api.setBaseUrl(serverUrlInput);
     setServerUrlInput(saved);
-    setShowServerUrl(false);
-    checkServer();
+    if (!usernameTouchedRef.current) setUsername(savedUsername(saved));
+    setAuthError('');
+    setNotice(`Server URL saved — ${saved}`);
+  };
+
+  const handleResetServerUrl = () => {
+    const url = api.resetBaseUrl();
+    setServerUrlInput(url);
+    if (!usernameTouchedRef.current) setUsername(savedUsername(url));
+    setAuthError('');
+    setNotice(`Server URL reset — ${url}`);
+  };
+
+  // Adopt the alternate-scheme URL the probe proved reachable.
+  const handleUseSuggestedUrl = () => {
+    if (!schemeSuggestion) return;
+    const saved = api.setBaseUrl(schemeSuggestion);
+    setServerUrlInput(saved);
+    // The probe already got a healthy /health from exactly this URL, so drop
+    // the offline banner now instead of letting it linger until the re-probe.
+    setServerOffline(false);
+    if (!usernameTouchedRef.current) setUsername(savedUsername(saved));
+    setAuthError('');
+    setNotice(`Server URL saved — ${saved}`);
+  };
+
+  // Reachability probe for the URL being typed (debounced).
+  useEffect(() => {
+    const raw = serverUrlInput.trim();
+    if (!raw) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      // Malformed URLs can't be probed — the Save/Login error explains why.
+      const check = api.validateBaseUrl(raw);
+      if (!check.ok) {
+        if (!cancelled) setServerOffline(false);
+        return;
+      }
+      api.pingHealth(check.url).then(async (res) => {
+        if (cancelled) return;
+        setServerOffline(res === null);
+        if (res !== null) {
+          setSchemeProbe(null);
+          return;
+        }
+        // Wrong scheme makes a live server look switched off (a plain-HTTP
+        // backend never completes a TLS handshake). Only once the primary
+        // probe failed do we try the other scheme, so a healthy server is
+        // never probed twice.
+        const alternate = await api.detectSchemeMismatch(check.url);
+        if (cancelled) return;
+        setSchemeProbe(alternate ? { url: check.url, alternate } : null);
+      });
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [serverUrlInput]);
+
+  const handleLogin = async () => {
+    if (!serverUrlInput.trim()) {
+      setAuthError('Please enter the server URL');
+      return;
+    }
+    const urlCheck = api.validateBaseUrl(serverUrlInput);
+    if (!urlCheck.ok) {
+      setAuthError(urlCheck.error || 'Invalid server URL');
+      return;
+    }
+    if (!username.trim() || !password) {
+      setAuthError('Please enter username and password');
+      return;
+    }
+    setAuthLoading(true);
+    setAuthError('');
+    setNotice('');
+    try {
+      // Apply the typed URL first — credentials are always checked by that server.
+      // It may be rewritten on a device (localhost -> the computer's LAN IP), so
+      // show the URL that is actually being used.
+      setServerUrlInput(api.setBaseUrl(serverUrlInput));
+      api.setToken(null);
+      const response = await api.login(username.trim(), password);
+      if (response.success && response.data) {
+        const { user: loggedUser, token } = response.data;
+        // Existing auth mechanism: token + per-URL session are already stored by
+        // api.login(); make sure the in-memory token is set before we leave.
+        api.setToken(token);
+        if (!rememberMe) {
+          const session = loadSession(api.getBaseUrl());
+          if (session) {
+            saveSession(api.getBaseUrl(), { ...session, username: '' });
+          }
+        }
+        onLoginSuccess(loggedUser);
+      } else {
+        setServerOffline(response.status === 0);
+        // Only a network failure is a loopback problem — a rejected password
+        // must never be masked by the "use your computer's IP" advice.
+        setAuthError(
+          (response.status === 0 && loopbackHint) ||
+            response.error ||
+            'Username and Password did not match'
+        );
+      }
+    } catch (_err) {
+      setAuthError(
+        loopbackHint ||
+          `Cannot reach server at ${api.getBaseUrl()} — check connection or server URL.`
+      );
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
   const { width, height } = useWindowDimensions();
@@ -98,37 +219,6 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   // gets ~50% of the screen, so scale content down until both halves fit.
   const scale = isWide ? 1 : Math.min(1, Math.max(0.5, height / 1010));
   const s = (n: number) => Math.round(n * scale);
-
-  const handleLogin = async () => {
-    if (!username.trim() || !password) {
-      setAuthError('Please enter username and password');
-      return;
-    }
-    setAuthLoading(true);
-    setAuthError('');
-    setNotice('');
-    try {
-      const response = await api.login(username.trim(), password);
-      if (response.success && response.data) {
-        const { user: loggedUser, token } = response.data;
-        api.setToken(token);
-        setStorageItemSync('smart_cafe_token', token);
-        setStorageItemSync('smart_cafe_user', JSON.stringify(loggedUser));
-        if (rememberMe) {
-          setStorageItemSync('smart_cafe_saved_username', username.trim());
-        } else {
-          removeStorageItemSync('smart_cafe_saved_username');
-        }
-        onLoginSuccess(loggedUser);
-      } else {
-        setAuthError(response.error || 'Username and Password did not match');
-      }
-    } catch (_err) {
-      setAuthError(`Cannot reach server at ${api.getBaseUrl()} — check connection or server URL.`);
-    } finally {
-      setAuthLoading(false);
-    }
-  };
 
   const formPanel = (
     <View
@@ -146,18 +236,39 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
         Please provide your login credentials.
       </Text>
 
-      {serverOffline ? (
+      {loopbackHint ? (
         <View
           style={[
             styles.errorBox,
             { padding: s(12), marginBottom: s(14), backgroundColor: '#FEF3C7', borderColor: '#FCD34D' },
           ]}
         >
-          <MaterialCommunityIcons name="cloud-off-outline" size={s(18)} color="#B45309" />
-          <Text style={[styles.errorText, { color: '#B45309' }]}>
-            Backend offline — demo login: waiter@leadingedge.com / Wait3rCafe123
-          </Text>
+          <MaterialCommunityIcons name="wifi-off" size={s(18)} color="#B45309" />
+          <Text style={[styles.errorText, { color: '#B45309' }]}>{loopbackHint}</Text>
         </View>
+      ) : null}
+
+      {serverOffline ? (
+        <Hoverable
+          style={[
+            styles.errorBox,
+            { padding: s(12), marginBottom: s(14), backgroundColor: '#FEF3C7', borderColor: '#FCD34D' },
+          ]}
+          onPress={schemeSuggestion ? handleUseSuggestedUrl : undefined}
+          disabled={!schemeSuggestion}
+          hoverOpacity={0.85}
+        >
+          <MaterialCommunityIcons
+            name={schemeSuggestion ? 'swap-horizontal' : 'cloud-off-outline'}
+            size={s(18)}
+            color="#B45309"
+          />
+          <Text style={[styles.errorText, { color: '#B45309' }]}>
+            {schemeSuggestion
+              ? `${serverUrlInput.trim() || api.getBaseUrl()} isn't answering — ${schemeSuggestion} is. Tap here to switch.`
+              : `Cannot reach ${serverUrlInput.trim() || api.getBaseUrl()} — check the server URL or start the backend.`}
+          </Text>
+        </Hoverable>
       ) : null}
 
       {authError ? (
@@ -177,6 +288,7 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
           placeholderTextColor="#8A8AB0"
           value={username}
           onChangeText={(text) => {
+            usernameTouchedRef.current = true;
             setUsername(text);
             setAuthError('');
           }}
@@ -287,10 +399,8 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
 
       <Hoverable
         style={[styles.logoTouch, { width: s(170), height: s(170), marginTop: s(16) }]}
-        onPressIn={handleLogoTap}
-        delayPressIn={0}
-        hoverOpacity={1}
-        hoverStyle={{ opacity: 1 }}
+        onPress={handleLogoTripleTap}
+        hoverOpacity={0.85}
         accessibilityRole="image"
         accessibilityLabel="Cafe logo"
       >
@@ -302,46 +412,66 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
       </Hoverable>
 
       {showServerUrl ? (
-        <View style={[styles.serverUrlBox, { marginTop: s(12), padding: s(12), borderRadius: s(8), width: Math.min(s(340), width - 48) }]}>
-          <Text style={[styles.serverUrlLabel, { fontSize: s(12) }]}>SERVER URL</Text>
+        <View style={[styles.serverUrlCard, { width: Math.min(s(340), width - 48), padding: s(16), marginTop: s(18) }]}>
+          <Text style={[styles.serverUrlLabel, { fontSize: s(12), marginBottom: s(8) }]}>SERVER URL</Text>
           <TextInput
-            style={[styles.serverUrlInput, { height: s(40), fontSize: s(14), paddingHorizontal: s(10) }]}
+            style={[styles.serverUrlInput, { height: s(44), fontSize: s(14), paddingHorizontal: s(12) }]}
+            placeholder="http://localhost:3000"
+            placeholderTextColor="#9CA3AF"
             value={serverUrlInput}
-            onChangeText={setServerUrlInput}
-            placeholder="http://192.168.1.10:3000"
-            placeholderTextColor="#8A8AB0"
+            onChangeText={(text) => {
+              setServerUrlInput(text);
+              setAuthError('');
+              // Each server URL remembers its own username — swap the pre-fill
+              // while the user hasn't started typing one by hand.
+              if (!usernameTouchedRef.current) {
+                setUsername(text.trim() ? savedUsername(api.normalizeUrl(text)) : '');
+              }
+            }}
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
+            editable={!authLoading}
           />
-          <View style={styles.serverUrlActions}>
+          <View style={{ flexDirection: 'row', gap: s(10), marginTop: s(12) }}>
             <Hoverable
-              style={[styles.serverUrlBtn, styles.serverUrlBtnSecondary, { height: s(36) }]}
-              onPress={() => {
-                setServerUrlInput(api.resetBaseUrl());
-                setShowServerUrl(false);
-                checkServer();
-              }}
+              style={[styles.serverUrlBtn, styles.serverUrlBtnReset, { flex: 1, height: s(44) }]}
+              onPress={handleResetServerUrl}
+              disabled={authLoading}
               hoverOpacity={0.8}
             >
-              <Text style={[styles.serverUrlBtnText, { fontSize: s(13) }]}>Reset</Text>
+              <Text style={[styles.serverUrlBtnResetText, { fontSize: s(14) }]}>Reset</Text>
             </Hoverable>
             <Hoverable
-              style={[styles.serverUrlBtn, styles.serverUrlBtnPrimary, { height: s(36) }]}
+              style={[styles.serverUrlBtn, styles.serverUrlBtnSave, { flex: 1, height: s(44) }]}
               onPress={handleSaveServerUrl}
+              disabled={authLoading}
               hoverOpacity={0.8}
             >
-              <Text style={[styles.serverUrlBtnText, { fontSize: s(13), color: COLORS.white }]}>Save</Text>
+              <Text style={[styles.serverUrlBtnSaveText, { fontSize: s(14) }]}>Save</Text>
             </Hoverable>
           </View>
+          {loopbackHint ? (
+            <Text style={[styles.serverUrlHint, { fontSize: s(12), marginTop: s(8) }]}>{loopbackHint}</Text>
+          ) : serverOffline ? (
+            <Hoverable
+              style={{ marginTop: s(8) }}
+              onPress={schemeSuggestion ? handleUseSuggestedUrl : undefined}
+              disabled={!schemeSuggestion}
+              hoverOpacity={0.8}
+            >
+              <Text style={[styles.serverUrlHint, { fontSize: s(12) }]}>
+                {schemeSuggestion
+                  ? `Server not reachable — switch to ${schemeSuggestion}.`
+                  : 'Server not reachable — check the address.'}
+              </Text>
+            </Hoverable>
+          ) : null}
         </View>
       ) : null}
-      <Hoverable
+
+      <View
         style={[styles.logoTouch, { width: Math.min(s(320), width - 48), height: s(110), marginTop: s(12) }]}
-        onPressIn={handleLogoTap}
-        delayPressIn={0}
-        hoverOpacity={1}
-        hoverStyle={{ opacity: 1 }}
         accessibilityRole="image"
         accessibilityLabel="Company logo"
       >
@@ -350,7 +480,7 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
           style={{ width: '100%', height: '100%' }}
           resizeMode="contain"
         />
-      </Hoverable>
+      </View>
     </View>
   );
 
@@ -550,18 +680,18 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
   },
 
-  serverUrlBox: {
-    backgroundColor: '#F8FAFC',
+  serverUrlCard: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: '#E5E7EB',
     alignSelf: 'center',
   },
 
   serverUrlLabel: {
-    color: COLORS.muted,
-    fontWeight: '800',
+    color: '#4B5563',
+    fontWeight: '700',
     letterSpacing: 1,
-    marginBottom: 6,
   },
 
   serverUrlInput: {
@@ -573,31 +703,36 @@ const styles = StyleSheet.create({
     ...(Platform.OS === 'web' && { outlineStyle: 'none' } as object),
   },
 
-  serverUrlActions: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 10,
-  },
-
   serverUrlBtn: {
-    flex: 1,
     borderRadius: 6,
     alignItems: 'center',
     justifyContent: 'center',
+    ...(Platform.OS === 'web' && { cursor: 'pointer', transition: 'all 0.15s ease' }),
   },
 
-  serverUrlBtnPrimary: {
-    backgroundColor: COLORS.green,
-  },
-
-  serverUrlBtnSecondary: {
+  serverUrlBtnReset: {
     backgroundColor: COLORS.white,
     borderWidth: 1,
     borderColor: '#D1D5DB',
   },
 
-  serverUrlBtnText: {
+  serverUrlBtnResetText: {
+    color: '#111827',
+    fontWeight: '600',
+  },
+
+  serverUrlBtnSave: {
+    backgroundColor: COLORS.green,
+  },
+
+  serverUrlBtnSaveText: {
+    color: COLORS.white,
     fontWeight: '700',
-    color: COLORS.inputText,
+  },
+
+  serverUrlHint: {
+    color: '#B45309',
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });

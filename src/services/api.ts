@@ -1,82 +1,27 @@
 // CafeOS API Service
-// Connects the Expo frontend to the backend API
+// Connects the Expo frontend to the backend API.
+// The backend Base URL lives in @/config/apiConfig — every request built here
+// (login, CRUD, WebSocket events) resolves through getBaseUrl(), so switching
+// the server URL switches the whole app at once.
 
 import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
-import { handleDemoRequest } from './demoData';
+import { clearSession, loadSession, saveSession } from '@/utils/sessions';
 import type { NotificationListResponse } from '@/utils/notifications';
-import { Platform } from 'react-native';
-import Constants from 'expo-constants';
+import {
+  alternateSchemeUrl,
+  describeLoopbackIssue,
+  getBaseUrl,
+  normalizeBaseUrl,
+  onBaseUrlChange,
+  resetBaseUrl,
+  setBaseUrl,
+  validateBaseUrl,
+} from '@/config/apiConfig';
+import type { BaseUrlValidation } from '@/config/apiConfig';
 
-// expo-device has no web support — lazy-load only when needed on native
-let isDevice: boolean | undefined;
-if (Platform.OS !== 'web') {
-  try {
-    const device = require('expo-device');
-    isDevice = device.isDevice;
-  } catch {
-    // expo-device not available (e.g. web bundle)
-  }
-}
-
-/**
- * Base URL resolution (single source — no fallback cascades):
- *   1. Explicitly saved value (Profile -> Configure Server URL)
- *   2. EXPO_PUBLIC_API_URL from the environment
- *   3. Web:   current origin (backend serves the SPA from the same port)
- *      Native in Expo Go: http://<dev-machine-LAN-IP>:3000 via Constants.expoGoConfig.debuggerHost
- *      Android emulator:  http://10.0.2.2:3000 (host loopback alias)
- *      Otherwise:         http://localhost:3000 (iOS simulator / same machine)
- */
-function resolveDefaultBaseUrl(): string {
-  const envUrl = process.env.EXPO_PUBLIC_API_URL;
-  if (envUrl && envUrl.trim()) {
-    return envUrl.trim();
-  }
-
-  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
-    // In production the backend serves the SPA on the same port (3000),
-    // so window.location.origin is correct. In dev mode the Expo web dev
-    // server runs on a different port (8081 / 19006), so fall back to the
-    // backend at localhost:3000.
-    const origin = new URL(window.location.origin);
-    if (!origin.port || origin.port === '3000') {
-      return window.location.origin;
-    }
-    return 'http://localhost:3000';
-  }
-  // Expo Go on a physical device: debuggerHost is the dev machine's LAN address
-  // the phone used to load this bundle — localhost would point back at the phone.
-  // It carries the Metro port (e.g. "192.168.10.232:8081"), so strip it and use
-  // the backend port instead.
-  const debuggerHost = Constants.expoGoConfig?.debuggerHost;
-  if (debuggerHost) {
-    const host = debuggerHost.split(':')[0];
-    return `http://${host}:3000`;
-  }
-  // Android emulator: 10.0.2.2 is the alias for the host machine's loopback.
-  if (Platform.OS === 'android' && !isDevice) {
-    return 'http://10.0.2.2:3000';
-  }
-  return 'http://localhost:3000';
-}
-
-const DEFAULT_BASE_URL = resolveDefaultBaseUrl();
 const LOCAL_ACTIVE_ORDERS_KEY = 'smart_cafe_active_orders';
-
-const DEMO_ACCOUNTS: Record<string, { password: string; user: StaffUser }> = {
-  'waiter@leadingedge.com': {
-    password: 'Wait3rCafe123',
-    user: { id: 2, name: 'Waiter Staff', email: 'waiter@leadingedge.com', role: 'WAITER' },
-  },
-  'chef@leadingedge.com': {
-    password: 'Ch3fCafe123',
-    user: { id: 3, name: 'Chef Staff', email: 'chef@leadingedge.com', role: 'CHEF' },
-  },
-  'cashier@leadingedge.com': {
-    password: 'Cash1erCafe123',
-    user: { id: 4, name: 'Cashier Staff', email: 'cashier@leadingedge.com', role: 'CASHIER' },
-  },
-};
+// Every request gets a deadline so a dead connection can't hang a screen forever.
+const REQUEST_TIMEOUT_MS = 20000;
 
 export interface ApiResponse<T> {
   success: boolean;
@@ -86,8 +31,6 @@ export interface ApiResponse<T> {
   status?: number;
   /** True when the request was cancelled by requestKey dedup — not a server error. */
   aborted?: boolean;
-  /** True when sign-in happened locally because the API server was unreachable. */
-  offline?: boolean;
 }
 
 export interface Section {
@@ -262,63 +205,103 @@ export interface DashboardData {
 }
 
 class ApiService {
-  private baseUrl: string = DEFAULT_BASE_URL;
   private token: string | null = null;
-  private offlineSession: boolean = getStorageItemSync('smart_cafe_offline_demo') === '1';
 
   constructor() {
-    let initial = DEFAULT_BASE_URL;
-    const saved = getStorageItemSync('smart_cafe_base_url');
-    if (saved && saved.trim()) {
-      initial = saved.trim();
-    }
-    this.baseUrl = this.normalizeUrl(initial);
+    this.token = loadSession(getBaseUrl())?.token ?? null;
+    // The URL can change from the login screen, Profile or any other module:
+    // every switch adopts that server's own session and drops the previous
+    // server's in-flight requests + cached data. Registered first, so it runs
+    // before later subscribers (e.g. the WebSocket event stream).
+    onBaseUrlChange(() => this.applySessionForBaseUrl());
   }
 
+  /** Single source of truth for the server URL — see @/config/apiConfig. */
+  private get baseUrl(): string {
+    return getBaseUrl();
+  }
+
+  /** Server URL every request is built from, e.g. https://server1.example.com */
   public getBaseUrl(): string {
-    return this.baseUrl;
+    return getBaseUrl();
   }
 
+  /**
+   * Point every request at another backend. The URL is validated, persisted
+   * (survives app restart) and that URL's session token is adopted.
+   * Invalid input leaves the current URL untouched — call validateBaseUrl()
+   * first when the value came from user input. Returns the URL now in effect.
+   */
   public setBaseUrl(url: string): string {
-    const clean = this.normalizeUrl(url);
-    this.baseUrl = clean;
-    setStorageItemSync('smart_cafe_base_url', clean);
-    return this.baseUrl;
+    return setBaseUrl(url).url;
   }
 
-  /** Forget the saved override and return to the environment default. */
+  /** Validate a typed URL without applying it: { ok, url, error? }. */
+  public validateBaseUrl(url: string): BaseUrlValidation {
+    return validateBaseUrl(url);
+  }
+
+  /** Forget the saved override and return to the environment/platform default. */
   public resetBaseUrl(): string {
-    removeStorageItemSync('smart_cafe_base_url');
-    this.baseUrl = this.normalizeUrl(DEFAULT_BASE_URL);
-    return this.baseUrl;
+    return resetBaseUrl();
+  }
+
+  /**
+   * Point the client at another backend: adopt that URL's own session token
+   * (none if it was never signed in) and drop every cache holding the previous
+   * server's data so it can never leak across URLs.
+   */
+  private applySessionForBaseUrl() {
+    const session = loadSession(this.baseUrl);
+    this.token = session?.token ?? null;
+    this.abortAllRequests();
+    this.invalidateMenuCache();
+    removeStorageItemSync('smart_cafe_cached_tables');
+    removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
   }
 
   /** Latency + reachability probe against /health. Returns null if unreachable. */
-  async pingHealth(): Promise<{ latencyMs: number } | null> {
+  async pingHealth(url: string = this.baseUrl): Promise<{ latencyMs: number } | null> {
     const start = Date.now();
+    // AbortController + setTimeout instead of AbortSignal.timeout(): the latter
+    // is missing from React Native's AbortSignal polyfill, and calling it would
+    // make every probe (and the login request) fail instantly on device.
+    const timeoutController = new AbortController();
+    const timeoutHandle = setTimeout(() => timeoutController.abort(), 4000);
     try {
-      const response = await fetch(`${this.baseUrl}/health`, {
-        signal: AbortSignal.timeout(4000),
+      const response = await fetch(`${url}/health`, {
+        signal: timeoutController.signal,
       });
-      if (!response.ok) return null;
-      await response.json();
+      // Any HTTP answer proves the host is up — only a network failure/timeout
+      // is "offline". Servers are not required to expose /health (the hosted
+      // production API answers 404 there), and a
+      // 404/405 used to be read as unreachable, showing a false "server
+      // offline" banner over a login endpoint that works. A 2xx body is still
+      // parsed as JSON so a captive-portal HTML page is not reported healthy.
+      if (response.ok) await response.json();
       return { latencyMs: Date.now() - start };
     } catch {
       return null;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 
-  private normalizeUrl(url: string): string {
-    let clean = (url || '').trim();
-    if (!clean) return DEFAULT_BASE_URL;
-    if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
-      clean = 'https://' + clean;
-    }
-    clean = clean.replace(/\/+$/, '');
-    if (clean.endsWith('/api')) {
-      clean = clean.substring(0, clean.length - 4);
-    }
-    return clean;
+  /**
+   * Does this address answer under the opposite scheme? Returns that URL when
+   * it does (e.g. https://localhost:3000 typed against a plain-HTTP dev server
+   * that is really http://localhost:3000), null otherwise. Call only after
+   * pingHealth() failed — the primary probe is never delayed by this one.
+   */
+  async detectSchemeMismatch(url: string = this.baseUrl): Promise<string | null> {
+    const alternate = alternateSchemeUrl(url);
+    if (!alternate) return null;
+    return (await this.pingHealth(alternate)) ? alternate : null;
+  }
+
+  /** Canonical form of a server URL (scheme, no trailing slash or /api). */
+  public normalizeUrl(url: string): string {
+    return normalizeBaseUrl(url);
   }
 
   setToken(token: string | null) {
@@ -327,14 +310,6 @@ class ApiService {
 
   getToken() {
     return this.token;
-  }
-
-  /** True while the current session was opened without a reachable backend. */
-  isOfflineSession(): boolean {
-    if (this.offlineSession) return true;
-    const flagged = getStorageItemSync('smart_cafe_offline_demo') === '1';
-    this.offlineSession = flagged;
-    return flagged;
   }
 
   private getCachedActiveOrders(): Order[] {
@@ -354,19 +329,7 @@ class ApiService {
     }
   }
 
-  private demoFallback<T>(endpoint: string, options?: RequestInit): ApiResponse<T> | null {
-    if (!this.isOfflineSession()) return null;
-    try {
-      const demo = handleDemoRequest(endpoint, options) as ApiResponse<T> | null;
-      // Tag demo responses so callers can tell them apart from real ones —
-      // the fake ids/prices must never be written into a server-backed cache.
-      return demo ? { ...demo, offline: true } : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private async request<T>(endpoint: string, options?: RequestInit & { requestKey?: string; signal?: AbortSignal }): Promise<ApiResponse<T>> {
+  private async request<T>(endpoint: string, options?: RequestInit & { requestKey?: string; signal?: AbortSignal; timeoutMs?: number }): Promise<ApiResponse<T>> {
     const formattedPath = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
     const url = `${this.baseUrl}/api${formattedPath}`;
 
@@ -384,19 +347,37 @@ class ApiService {
     if (options?.requestKey) {
       controller = this.getRequestController(options.requestKey);
     }
-    const signal = options?.signal ?? controller?.signal;
+    const externalSignal = options?.signal ?? controller?.signal ?? null;
+
+    // Deadline: a hung connection must never leave the UI waiting forever.
+    const timeoutMs = options?.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    const timeoutController = new AbortController();
+    let timedOut = false;
+    const relayAbort = () => timeoutController.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) relayAbort();
+      else externalSignal.addEventListener('abort', relayAbort);
+    }
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, timeoutMs);
+    const signal = timeoutController.signal;
 
     let response: Response;
     try {
       response = await fetch(url, { ...options, headers, signal });
     } catch (error: any) {
+      if (timedOut) {
+        return { success: false, error: `Request timed out after ${Math.round(timeoutMs / 1000)}s`, status: 0 };
+      }
       if (error?.name === 'AbortError' || error?.message?.includes('abort')) {
         return { success: false, error: 'Request aborted', aborted: true, status: 0 };
       }
-      const demo = this.demoFallback<T>(formattedPath, options);
-      if (demo) return demo;
       return { success: false, error: error?.message || 'Network error — server unreachable', status: 0 };
     } finally {
+      clearTimeout(timeoutHandle);
+      externalSignal?.removeEventListener('abort', relayAbort);
       if (options?.requestKey) {
         this.releaseRequestController(options.requestKey);
       }
@@ -405,18 +386,12 @@ class ApiService {
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       const text = await response.text().catch(() => '');
-      const demo = this.demoFallback<T>(formattedPath, options);
-      if (demo) return demo;
       return { success: false, error: text || `Invalid server response (HTTP ${response.status})`, status: response.status };
     }
 
     const data = await response.json().catch(() => ({} as any));
 
     if (!response.ok) {
-      if (response.status === 404 || response.status === 405) {
-        const demo = this.demoFallback<T>(formattedPath, options);
-        if (demo) return demo;
-      }
       return {
         success: false,
         error: data.error || data.responseText || data.message || `Request failed (HTTP ${response.status})`,
@@ -428,88 +403,130 @@ class ApiService {
   }
 
   // ─── Auth ──────────────────────────────────────────────────────────────────
-  private offlineLogin(
-    username: string,
-    password: string,
-  ): ApiResponse<{ token: string; user: StaffUser }> | null {
-    const account = DEMO_ACCOUNTS[username.trim().toLowerCase()];
-    if (!account || account.password !== password) return null;
-    const user: StaffUser = { ...account.user };
-    const token = `demo-token-${user.role.toLowerCase()}-${user.id}-${Date.now()}`;
-    this.offlineSession = true;
-    setStorageItemSync('smart_cafe_offline_demo', '1');
-    this.setToken(token);
-    return { success: true, data: { token, user }, status: 0, offline: true };
-  }
-
-  private unreachableLogin(
-    username: string,
-    password: string,
-    error: string,
-    status: number,
-  ): ApiResponse<{ token: string; user: StaffUser }> {
-    const demo = this.offlineLogin(username, password);
-    if (demo) return demo;
-    const account = DEMO_ACCOUNTS[username.trim().toLowerCase()];
-    if (!account) {
-      return {
-        success: false,
-        error: `Server unreachable at ${this.baseUrl} and "${username}" is not a demo account (try waiter@leadingedge.com)`,
-        status,
-      };
-    }
-    return { success: false, error: error || 'Server unreachable — password rejected for this demo account', status };
-  }
-
+  /**
+   * Sign in against the currently configured server URL. Credentials are only
+   * ever checked by that backend — there is no local/demo fallback. A successful
+   * sign-in stores the session under this URL so every server keeps its own
+   * login.
+   */
   async login(username: string, password: string): Promise<ApiResponse<{ token: string; user: StaffUser }>> {
+    // AbortController + setTimeout rather than AbortSignal.timeout(): React
+    // Native's AbortSignal polyfill has no timeout() — using it throws a
+    // TypeError before any request is sent, so login would always fail on a
+    // device while working in the browser.
+    const timeoutController = new AbortController();
+    let timedOut = false;
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, REQUEST_TIMEOUT_MS);
     try {
-      const response = await fetch(`${this.baseUrl}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
+      // Two login paths exist in the wild: /api/auth/login (local backend) and
+      // /api/account/login (production). Try the first; only if the server says
+      // the route itself is missing do we retry the other, so a 404 never turns
+      // into "Route not found" on the login screen.
+      let response: Response | undefined;
+      for (const path of ['/api/auth/login', '/api/account/login']) {
+        response = await fetch(`${this.baseUrl}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+          signal: timeoutController.signal,
+        });
+        if (response.status !== 404) break;
+      }
+      if (!response) {
+        return { success: false, error: `Login failed — no response from ${this.baseUrl}`, status: 0 };
+      }
 
       const contentType = response.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         const text = await response.text().catch(() => '');
-        return this.unreachableLogin(username, password, text || `Invalid server response (HTTP ${response.status})`, response.status);
+        return {
+          success: false,
+          error: text || `Invalid server response from ${this.baseUrl} (HTTP ${response.status})`,
+          status: response.status,
+        };
       }
       const data = await response.json().catch(() => ({} as any));
 
-      // Backend responds: { success: true, data: { token, user } }
-      if (response.ok && data.success !== false && data.data?.token && data.data?.user) {
+      // Two success shapes exist: the local CafeOS backend wraps the payload
+      // as { success: true, data: { token, user } }, while /api/account/login
+      // (production) returns it flat:
+      //   { user_id, full_name, email, token, organisation_detail, ... }
+      const wrapped = data.data?.token && data.data?.user ? data.data : null;
+      const flat = data.token && (data.user_id != null || data.full_name) ? data : null;
+      const payload = data.success === false ? null : wrapped || flat;
+      if (response.ok && payload) {
+        const wrappedUser = payload.user || {};
         const user: StaffUser = {
-          id: data.data.user.id,
-          name: data.data.user.name,
-          email: data.data.user.email || username,
-          role: data.data.user.role || 'WAITER',
+          id: wrappedUser.id ?? payload.user_id,
+          name: wrappedUser.name ?? payload.full_name ?? username,
+          email: (wrappedUser.email ?? payload.email) || username,
+          role: wrappedUser.role ?? payload.role ?? 'WAITER',
         };
-        this.setToken(data.data.token);
-        this.offlineSession = false;
-        removeStorageItemSync('smart_cafe_offline_demo');
-        // A real sign-in means we are back on the live backend — any menu
-        // snapshot cached during an offline/demo session is no longer valid.
+        this.setToken(payload.token);
+        saveSession(this.baseUrl, { token: payload.token, user, username: username.trim() });
         this.invalidateMenuCache();
-        return { success: true, data: { token: data.data.token, user }, status: response.status };
+        return { success: true, data: { token: payload.token, user }, status: response.status };
       }
 
       return {
         success: false,
-        error: data.error || data.responseText || data.message || 'Username and Password did not match',
+        error:
+          response.status === 404
+            ? `Login route not found on ${this.baseUrl} — check the server URL`
+            : data.error || data.responseText || data.message || 'Username and Password did not match',
         status: response.status,
       };
     } catch (error: any) {
-      return this.unreachableLogin(username, password, error?.message || 'Network error during login — server unreachable', 0);
+      if (timedOut) {
+        return {
+          success: false,
+          error: `Login timed out — no response from ${this.baseUrl}`,
+          status: 0,
+        };
+      }
+      if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+        return {
+          success: false,
+          error: `Login timed out — no response from ${this.baseUrl}`,
+          status: 0,
+        };
+      }
+      // A loopback URL on a device can never work — say so instead of showing
+      // a generic "server unreachable" that gives no way forward.
+      const loopbackHint = describeLoopbackIssue(this.baseUrl);
+      return {
+        success: false,
+        error: loopbackHint
+          ? `Cannot reach server at ${this.baseUrl}. ${loopbackHint}`
+          : `Cannot reach server at ${this.baseUrl} — check the server URL and connection`,
+        status: 0,
+      };
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 
-  async logout() {
-    const res = await this.request<{ message: string }>('/auth/logout', { method: 'POST' });
+  async logout(): Promise<ApiResponse<{ message: string }>> {
+    const token = this.token;
+    // Clear the local session first — sign-out must never wait on the network.
+    clearSession(this.baseUrl);
     this.setToken(null);
-    this.offlineSession = false;
-    removeStorageItemSync('smart_cafe_offline_demo');
     this.invalidateMenuCache();
-    return res;
+    removeStorageItemSync('smart_cafe_cached_tables');
+    removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
+    if (!token) {
+      return { success: true, data: { message: 'Signed out' }, status: 200 };
+    }
+    // Fire-and-forget from the caller's perspective; short deadline so a dead
+    // server can't keep this promise hanging.
+    return this.request<{ message: string }>('/auth/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      timeoutMs: 5000,
+    });
   }
 
   // ─── Settings ─────────────────────────────────────────────────────────────
@@ -524,7 +541,8 @@ class ApiService {
 
   // ─── Tables ───────────────────────────────────────────────────────────────
   async getTables(sectionId?: number): Promise<ApiResponse<Table[]>> {
-    const res = await this.request<Table[]>('/tables');
+    // requestKey coalesces concurrent table fetches — the newest wins, stale ones abort.
+    const res = await this.request<Table[]>('/tables', { requestKey: 'tables' });
     if (res.success && res.data) {
       const serialized = JSON.stringify(res.data);
       if (getStorageItemSync('smart_cafe_cached_tables') !== serialized) {
@@ -556,7 +574,7 @@ class ApiService {
   }
 
   // ─── Menu ─────────────────────────────────────────────────────────────────
-  /** Drop the persisted menu snapshot (stale or demo data) and its lookup caches. */
+  /** Drop the persisted menu snapshot (stale or cross-server data) and its lookup caches. */
   invalidateMenuCache() {
     removeStorageItemSync('smart_cafe_cached_menu');
     this.invalidateResolveCaches();
@@ -578,13 +596,11 @@ class ApiService {
    *  - default: serves the cached snapshot immediately and refreshes in the background
    *  - force:   skip the cache read and wait for a fresh response (order screens —
    *             they submit these ids to the backend, so they must be current)
-   * Offline/demo responses are never persisted: their fake ids would be rejected
-   * by the real backend with "Menu item not found".
    */
   async getMenu(options?: { force?: boolean; requestKey?: string }): Promise<ApiResponse<MenuCategory[]>> {
     const fetchFresh = async (): Promise<ApiResponse<MenuCategory[]>> => {
       const res = await this.request<MenuCategory[]>('/menu', { requestKey: options?.requestKey });
-      if (res.success && res.data && !res.offline) {
+      if (res.success && res.data) {
         setStorageItemSync('smart_cafe_cached_menu', JSON.stringify(res.data));
         this.invalidateResolveCaches();
       }
@@ -908,9 +924,6 @@ class ApiService {
    * Events: order.created | order.status | order.paid | order.cancelled | table.status | table.session | menu.availability
    */
   subscribeToEvents(onEvent: (event: { type: string; payload: any; ts: number }) => void): () => void {
-    if (this.isOfflineSession()) {
-      return () => {};
-    }
     let ws: WebSocket | null = null;
     let backoffMs = 1000;
     let closed = false;
@@ -943,10 +956,31 @@ class ApiService {
       };
     };
 
+    // A server-URL switch must move this stream to the new backend now — not
+    // on the next backoff retry against a server the user already left.
+    const unsubscribeUrlChange = onBaseUrlChange(() => {
+      if (closed) return;
+      if (ws) {
+        const previous = ws;
+        ws = null;
+        this._eventConnected = false;
+        previous.onclose = null;
+        previous.onerror = null;
+        previous.close();
+      }
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      backoffMs = 1000;
+      connect();
+    });
+
     connect();
 
     return () => {
       closed = true;
+      unsubscribeUrlChange();
       if (retryTimer) clearTimeout(retryTimer);
       ws?.close();
     };

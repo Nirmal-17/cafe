@@ -17,6 +17,8 @@ import { Hoverable } from '@/components/Hoverable';
 import { Order, StaffUser, api } from '@/services/api';
 import { orderApi } from '@/services/orderApi';
 import { executeOrderPrint } from '@/utils/print';
+import { showBottomToast } from '@/components/BottomToast';
+import { notifyPrintProceeded } from '@/utils/printProceededToast';
 import {
   clearAllHistory,
   getClearedState,
@@ -228,12 +230,20 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
       const order = orders.find(o => o.id === orderId);
       const success = await executeOrderPrint(orderId, order);
       if (success) {
-        webAlert('Printing', 'Receipt sent to printer!');
+        notifyPrintProceeded(orderId, order?.table?.tableNumber);
       } else {
-        webAlert('Notice', 'Print dialog displayed or sent to print queue.');
+        showBottomToast({
+          title: 'Printing',
+          message: 'Print dialog displayed or sent to print queue.',
+          tone: 'info',
+        });
       }
     } catch {
-      webAlert('Error', 'Failed to connect to printer.');
+      showBottomToast({
+        title: 'Print Failed',
+        message: 'Failed to connect to printer.',
+        tone: 'error',
+      });
     }
   };
 
@@ -247,126 +257,131 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
         <Text style={styles.headerTitle}>Past Order Receipts</Text>
       </View>
 
-      {/* Stats Bar */}
-      <View style={styles.statsBar}>
-        <View style={styles.statItem}>
-          <Text style={styles.statValue}>{stats.total}</Text>
-          <Text style={styles.statLabel}>Orders</Text>
+      {/* Whole page scrolls together: stats bar, search, filters and orders */}
+      <ScrollView
+        style={styles.bodyScroll}
+        contentContainerStyle={styles.bodyContent}
+        showsVerticalScrollIndicator
+      >
+        {/* Stats Bar */}
+        <View style={styles.statsBar}>
+          <View style={styles.statItem}>
+            <Text style={styles.statValue}>{stats.total}</Text>
+            <Text style={styles.statLabel}>Orders</Text>
+          </View>
+          <View style={styles.statDivider} />
+          <View style={styles.statItem}>
+            <Text style={[styles.statValue, { color: COLOR_SUCCESS }]}>Rs. {stats.totalRevenue.toLocaleString()}</Text>
+            <Text style={styles.statLabel}>Revenue</Text>
+          </View>
+          <View style={styles.statDivider} />
+          <View style={styles.statItem}>
+            <Text style={[styles.statValue, { color: COLOR_SUCCESS }]}>{stats.paid}</Text>
+            <Text style={styles.statLabel}>Paid</Text>
+          </View>
+          <View style={styles.statDivider} />
+          <View style={styles.statItem}>
+            <Text style={[styles.statValue, { color: stats.unpaid > 0 ? BRAND_ORANGE : TEXT_MUTED }]}>{stats.unpaid}</Text>
+            <Text style={styles.statLabel}>Unpaid</Text>
+          </View>
         </View>
-        <View style={styles.statDivider} />
-        <View style={styles.statItem}>
-          <Text style={[styles.statValue, { color: COLOR_SUCCESS }]}>Rs. {stats.totalRevenue.toLocaleString()}</Text>
-          <Text style={styles.statLabel}>Revenue</Text>
-        </View>
-        <View style={styles.statDivider} />
-        <View style={styles.statItem}>
-          <Text style={[styles.statValue, { color: COLOR_SUCCESS }]}>{stats.paid}</Text>
-          <Text style={styles.statLabel}>Paid</Text>
-        </View>
-        <View style={styles.statDivider} />
-        <View style={styles.statItem}>
-          <Text style={[styles.statValue, { color: stats.unpaid > 0 ? BRAND_ORANGE : TEXT_MUTED }]}>{stats.unpaid}</Text>
-          <Text style={styles.statLabel}>Unpaid</Text>
-        </View>
-      </View>
 
-      {/* Search */}
-      <View style={styles.searchContainer}>
-        <View style={styles.searchBarWrapper}>
-          <MaterialIcons name="search" size={20} color={TEXT_MUTED} style={{ marginRight: 8 }} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search by order ID or table..."
-            placeholderTextColor={TEXT_MUTED}
-            value={searchQuery}
-            onChangeText={handleSearch}
-          />
-          {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => handleSearch('')}>
-              <MaterialIcons name="close" size={18} color={TEXT_MUTED} />
+        {/* Search */}
+        <View style={styles.searchContainer}>
+          <View style={styles.searchBarWrapper}>
+            <MaterialIcons name="search" size={20} color={TEXT_MUTED} style={{ marginRight: 8 }} />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search by order ID or table..."
+              placeholderTextColor={TEXT_MUTED}
+              value={searchQuery}
+              onChangeText={handleSearch}
+            />
+            {searchQuery.length > 0 && (
+              <TouchableOpacity onPress={() => handleSearch('')}>
+                <MaterialIcons name="close" size={18} color={TEXT_MUTED} />
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {/* Clear History */}
+          {historyCleared ? (
+            <View style={styles.clearHistoryRow}>
+              <MaterialIcons name="delete-outline" size={16} color={COLOR_ERROR} />
+              <Text style={styles.clearHistoryRowText}>History cleared</Text>
+            </View>
+          ) : (
+            <TouchableOpacity style={styles.clearHistoryRow} onPress={handleClearHistory}>
+              <MaterialIcons name="delete-outline" size={16} color={COLOR_ERROR} />
+              <Text style={styles.clearHistoryRowText}>Clear History</Text>
             </TouchableOpacity>
           )}
         </View>
 
-        {/* Clear History */}
-        {historyCleared ? (
-          <View style={styles.clearHistoryRow}>
-            <MaterialIcons name="delete-outline" size={16} color={COLOR_ERROR} />
-            <Text style={styles.clearHistoryRowText}>History cleared</Text>
-          </View>
-        ) : (
-          <TouchableOpacity style={styles.clearHistoryRow} onPress={handleClearHistory}>
-            <MaterialIcons name="delete-outline" size={16} color={COLOR_ERROR} />
-            <Text style={styles.clearHistoryRowText}>Clear History</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      {/* Date Filter */}
-      <View style={styles.dateFilterSection}>
-        <View style={styles.dateInputRow}>
-          <TouchableOpacity
-            style={[styles.dateInput, dateFrom && styles.dateInputActive]}
-            onPress={() => setShowDatePicker('from')}
-          >
-            <MaterialIcons name="calendar-today" size={14} color={dateFrom ? BRAND_ORANGE : TEXT_MUTED} />
-            <Text style={[styles.dateInputText, dateFrom && styles.dateInputTextActive]}>
-              {dateFrom || 'From'}
-            </Text>
-          </TouchableOpacity>
-          <View style={{ marginHorizontal: 4 }}>
-            <MaterialIcons name="arrow-forward" size={16} color={TEXT_MUTED} />
-          </View>
-          <TouchableOpacity
-            style={[styles.dateInput, dateTo && styles.dateInputActive]}
-            onPress={() => setShowDatePicker('to')}
-          >
-            <MaterialIcons name="calendar-today" size={14} color={dateTo ? BRAND_ORANGE : TEXT_MUTED} />
-            <Text style={[styles.dateInputText, dateTo && styles.dateInputTextActive]}>
-              {dateTo || 'To'}
-            </Text>
-          </TouchableOpacity>
-          {!!(dateFrom || dateTo) && (
-            <TouchableOpacity onPress={clearDateFilter} style={styles.clearDateBtn}>
-              <MaterialIcons name="close" size={16} color={COLOR_ERROR} />
-            </TouchableOpacity>
-          )}
-        </View>
-      </View>
-
-      {/* Status Filters */}
-      <View style={styles.filterRow}>
-        {(['ALL', 'COMPLETED', 'CANCELLED', 'SERVED', 'PAID'] as const).map((s) => {
-          const active = statusFilter === s;
-          const colors: Record<string, { bg: string; text: string }> = {
-            ALL: { bg: '#F3F4F6', text: '#374151' },
-            COMPLETED: { bg: '#DCFCE7', text: '#16A34A' },
-            CANCELLED: { bg: '#FEE2E2', text: '#DC2626' },
-            SERVED: { bg: '#DBEAFE', text: '#2563EB' },
-            PAID: { bg: '#DCFCE7', text: '#16A34A' },
-          };
-          const c = colors[s];
-          return (
+        {/* Date Filter */}
+        <View style={styles.dateFilterSection}>
+          <View style={styles.dateInputRow}>
             <TouchableOpacity
-              key={s}
-              activeOpacity={0.7}
-              onPress={() => handleStatusChange(s)}
-              style={[styles.filterChip, {
-                backgroundColor: active ? c.bg : '#F3F4F6',
-                borderWidth: active ? 1.5 : 0,
-                borderColor: active ? c.text : 'transparent',
-              }]}
+              style={[styles.dateInput, dateFrom && styles.dateInputActive]}
+              onPress={() => setShowDatePicker('from')}
             >
-              <Text style={[styles.filterChipText, { color: active ? c.text : '#9CA3AF', fontWeight: active ? '800' : '600' }]}>
-                {s === 'PAID' ? 'PAID (all)' : s.charAt(0) + s.slice(1).toLowerCase()}
+              <MaterialIcons name="calendar-today" size={14} color={dateFrom ? BRAND_ORANGE : TEXT_MUTED} />
+              <Text style={[styles.dateInputText, dateFrom && styles.dateInputTextActive]}>
+                {dateFrom || 'From'}
               </Text>
             </TouchableOpacity>
-          );
-        })}
-      </View>
+            <View style={{ marginHorizontal: 4 }}>
+              <MaterialIcons name="arrow-forward" size={16} color={TEXT_MUTED} />
+            </View>
+            <TouchableOpacity
+              style={[styles.dateInput, dateTo && styles.dateInputActive]}
+              onPress={() => setShowDatePicker('to')}
+            >
+              <MaterialIcons name="calendar-today" size={14} color={dateTo ? BRAND_ORANGE : TEXT_MUTED} />
+              <Text style={[styles.dateInputText, dateTo && styles.dateInputTextActive]}>
+                {dateTo || 'To'}
+              </Text>
+            </TouchableOpacity>
+            {!!(dateFrom || dateTo) && (
+              <TouchableOpacity onPress={clearDateFilter} style={styles.clearDateBtn}>
+                <MaterialIcons name="close" size={16} color={COLOR_ERROR} />
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
 
-      {/* Orders List */}
-      <ScrollView style={styles.bodyScroll} contentContainerStyle={styles.bodyContent} showsVerticalScrollIndicator={false}>
+        {/* Status Filters */}
+        <View style={styles.filterRow}>
+          {(['ALL', 'COMPLETED', 'CANCELLED', 'SERVED', 'PAID'] as const).map((s) => {
+            const active = statusFilter === s;
+            const colors: Record<string, { bg: string; text: string }> = {
+              ALL: { bg: '#F3F4F6', text: '#374151' },
+              COMPLETED: { bg: '#DCFCE7', text: '#16A34A' },
+              CANCELLED: { bg: '#FEE2E2', text: '#DC2626' },
+              SERVED: { bg: '#DBEAFE', text: '#2563EB' },
+              PAID: { bg: '#DCFCE7', text: '#16A34A' },
+            };
+            const c = colors[s];
+            return (
+              <TouchableOpacity
+                key={s}
+                activeOpacity={0.7}
+                onPress={() => handleStatusChange(s)}
+                style={[styles.filterChip, {
+                  backgroundColor: active ? c.bg : '#F3F4F6',
+                  borderWidth: active ? 1.5 : 0,
+                  borderColor: active ? c.text : 'transparent',
+                }]}
+              >
+                <Text style={[styles.filterChipText, { color: active ? c.text : '#9CA3AF', fontWeight: active ? '800' : '600' }]}>
+                  {s === 'PAID' ? 'PAID (all)' : s.charAt(0) + s.slice(1).toLowerCase()}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* Orders List */}
         {loading && orders.length === 0 ? (
           <View style={styles.emptyState}>
             <ActivityIndicator size="large" color={BRAND_ORANGE} />
@@ -660,10 +675,10 @@ const styles = StyleSheet.create({
   filterChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16 },
   filterChipText: { fontSize: 12 },
   bodyScroll: { flex: 1, backgroundColor: BG_LIGHT },
-  bodyContent: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 90 },
-  emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, gap: 8 },
+  bodyContent: { paddingTop: 4, paddingBottom: 90 },
+  emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, marginHorizontal: 16, gap: 8 },
   emptyStateText: { fontSize: 14, color: TEXT_MUTED, fontWeight: '500' },
-  dateGroup: { marginBottom: 16 },
+  dateGroup: { marginHorizontal: 16, marginBottom: 16 },
   dateGroupHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8, paddingHorizontal: 4 },
   dateGroupLabel: { fontSize: 14, fontWeight: '700', color: TEXT_DARK },
   dateGroupCount: { fontSize: 12, color: TEXT_MUTED },
