@@ -807,9 +807,9 @@ export default function MainAppContainer() {
               >
                 <>
                   <Image
-                    source={require('../../assets/images/profile.png')}
+                    source={require('../../assets/images/profile.jpg')}
                     style={styles.darkDrawerUserAvatar}
-                    resizeMode="cover"
+                    resizeMode="contain"
                   />
                   <View style={{ flex: 1 }}>
                     <Text style={styles.darkDrawerUserName}>{user?.name || 'Staff'}</Text>
@@ -913,30 +913,6 @@ export default function MainAppContainer() {
                 <Text style={styles.darkDrawerItemIcon}>📶</Text>
                 <Text style={styles.darkDrawerItemText}>Connection Status</Text>
               </Hoverable>
-
-                <Hoverable
-                  style={styles.darkDrawerItem}
-                  hoverStyle={styles.darkDrawerItemHover}
-                  onPress={async () => {
-                    closeDrawer();
-                    const res = await api.getPrinterStatus();
-                    if (res.success && res.data) {
-                      webAlert(
-                        'Printer',
-                        `Configured: ${res.data.configured ? 'Yes' : 'No'}\n` +
-                        `Address: ${res.data.host ? `${res.data.host}:${res.data.port}` : 'not set'}\n` +
-                        `Queue: ${res.data.queueLength} job(s)`,
-                        [{ text: 'OK' }]
-                      );
-                    } else {
-                      webAlert('Printer', 'Printer status unavailable — server unreachable.');
-                    }
-                  }}
-                  hoverOpacity={1}
-                >
-                  <Text style={styles.darkDrawerItemIcon}>🖨️</Text>
-                  <Text style={styles.darkDrawerItemText}>Printer</Text>
-                </Hoverable>
 
                 <View style={styles.darkDrawerDivider} />
 
@@ -1104,9 +1080,9 @@ export default function MainAppContainer() {
               <View style={styles.profileCard}>
                 <View style={styles.profileAvatar}>
                   <Image
-                    source={require('../../assets/images/profile.png')}
+                    source={require('../../assets/images/profile.jpg')}
                     style={{ width: 64, height: 64, borderRadius: 32 }}
-                    resizeMode="cover"
+                    resizeMode="contain"
                   />
                 </View>
                 <Text style={styles.profileName}>{user?.name || 'Staff On Duty'}</Text>
@@ -1422,9 +1398,9 @@ export default function MainAppContainer() {
         )}
         <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('profile'); }} hoverOpacity={0.7}>
           <Image
-            source={require('../../assets/images/profile.png')}
+            source={require('../../assets/images/profile.jpg')}
             style={[styles.tabProfileAvatar, activeTab === 'profile' && styles.tabProfileAvatarActive]}
-            resizeMode="cover"
+            resizeMode="contain"
           />
           <Text style={[styles.tabBtnText, activeTab === 'profile' && styles.tabBtnTextActive]}>Profile</Text>
         </Hoverable>
@@ -1549,7 +1525,7 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   darkDrawerBrand: { color: '#000000', fontSize: getFontSize(bp.breakpoint, 'xxl'), fontWeight: '800', fontFamily: 'Times New Roman', letterSpacing: 0.5 },
   darkDrawerDivider: { height: 1, backgroundColor: '#E5E7EB', marginHorizontal: getSpacing(bp.breakpoint, 'md'), marginVertical: getSpacing(bp.breakpoint, 'sm') },
   darkDrawerUserBlock: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'md') },
-  darkDrawerUserAvatar: { width: 40, height: 40, borderRadius: 20, marginRight: getSpacing(bp.breakpoint, 'sm'), backgroundColor: '#E5E7EB' },
+  darkDrawerUserAvatar: { width: 40, height: 40, borderRadius: 20, marginRight: getSpacing(bp.breakpoint, 'sm'), backgroundColor: '#FFFFFF' },
   darkDrawerUserName: { color: '#000000', fontSize: getFontSize(bp.breakpoint, 'lg'), fontWeight: '700' },
   darkDrawerUserRole: { color: '#6B7280', fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '500', marginTop: getSpacing(bp.breakpoint, 'xs') },
   darkDrawerItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'md'), borderRadius: getBorderRadius(bp.breakpoint, 'md'), marginHorizontal: getSpacing(bp.breakpoint, 'sm'), marginVertical: getSpacing(bp.breakpoint, 'xs'), ...(Platform.OS === 'web' ? { cursor: 'pointer' } : {}) },

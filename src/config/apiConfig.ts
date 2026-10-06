@@ -16,7 +16,7 @@ import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@
 export const BASE_URL_STORAGE_KEY = 'smart_cafe_base_url';
 
 /** Production CafeOS server — the default when no saved/env URL exists. */
-export const CAFEOS_PRODUCTION_URL = 'http://localhost:3000';
+export const CAFEOS_PRODUCTION_URL = 'https://cafeos.leadingedge.com.np';
 
 // ── Loopback handling ───────────────────────────────────────────────────────
 // http://localhost:3000 means "this device" — on a phone/emulator that is the

@@ -59,7 +59,7 @@ export function AnimatedSplashOverlay({ onFinish }: AnimatedSplashOverlayProps) 
         {/* Center Section - Cafe Logo Image */}
         <View style={styles.centerSection}>
           <Image
-            source={require('../../assets/images/cafelogo.png')}
+            source={require('../../assets/images/cafelogo.jpg')}
             style={styles.centerLogoImage}
             resizeMode="contain"
           />
@@ -102,8 +102,8 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   centerLogoImage: {
-    width: 300,
-    height: 130,
+    width: 260,
+    height: 94,
     maxWidth: '90%',
   },
   bottomFooter: {

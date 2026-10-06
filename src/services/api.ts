@@ -6,6 +6,22 @@
 
 import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
 import { clearSession, loadSession, saveSession } from '@/utils/sessions';
+import {
+  buildMenuCategories,
+  categoryEntriesFromCategories,
+  categoryEntriesFromExplore,
+  mapMenuItem,
+} from '@/utils/menuCatalogue';
+import type { RemoteMenuCategory, RemoteMenuItem, RemoteMenuRow } from '@/utils/menuCatalogue';
+import {
+  mapCafeTable,
+  mapCafeTableToTable,
+  mapCustomer,
+  mapTableCategory,
+  sectionNamesFromCategories,
+  sectionsFromTables,
+} from '@/utils/productionFeeds';
+import type { RemoteCafeTable, RemoteCustomer, RemoteTableCategory } from '@/utils/productionFeeds';
 import type { NotificationListResponse } from '@/utils/notifications';
 import {
   alternateSchemeUrl,
@@ -22,6 +38,29 @@ import type { BaseUrlValidation } from '@/config/apiConfig';
 const LOCAL_ACTIVE_ORDERS_KEY = 'smart_cafe_active_orders';
 // Every request gets a deadline so a dead connection can't hang a screen forever.
 const REQUEST_TIMEOUT_MS = 20000;
+// A hosted feed the server does not expose is remembered for a minute: the
+// home screen refreshes every few seconds and must not spend a full round
+// trip (or a redirect hop) re-probing a route that will never exist.
+const FEED_MISS_TTL_MS = 60000;
+
+/**
+ * Did the server answer with something that is not the endpoint? 404/405 are
+ * the obvious ones; a redirect (the hosted server sends unauthenticated
+ * requests to its HTML login page) arrives as a 200 whose body is markup, so
+ * an error starting with "<" counts too. 401/403 never count: they mean the
+ * session died, and hiding that behind a "route missing" memory would keep the
+ * app signed in against a server that rejected the token.
+ */
+const isRouteMissing = (res: ApiResponse<unknown>): boolean =>
+  [404, 405, 301, 302, 303, 307, 308].includes(res.status ?? -1) || /^\s*</.test(res.error || '');
+
+/** Re-type a failed feed request without pretending it carried data. */
+const feedFailure = <T>(res: ApiResponse<unknown>): ApiResponse<T> => ({
+  success: false,
+  error: res.error,
+  status: res.status,
+  aborted: res.aborted,
+});
 
 export interface ApiResponse<T> {
   success: boolean;
@@ -86,6 +125,44 @@ export interface MenuCategory {
   description: string | null;
   items?: MenuItem[];
   _count?: { items: number };
+}
+
+/** Raw catalogue row shapes from /api/menu-item/all + /api/menucategory/all. */
+export type { RemoteMenuCategory, RemoteMenuItem, RemoteMenuRow } from '@/utils/menuCatalogue';
+
+export interface TableCategory {
+  id: number;
+  name: string;
+  description: string | null;
+  status?: 'ACTIVE' | 'INACTIVE';
+  createdAt?: string;
+  _count?: { tables: number };
+}
+
+export interface CafeTable {
+  id: number;
+  tableCategoryId: number;
+  tableNumber: string;
+  capacity: number;
+  status: 'AVAILABLE' | 'OCCUPIED' | 'RESERVED' | 'CLEANING' | 'PENDING_BILL';
+  isReserved?: boolean;
+  createdAt?: string;
+  tableCategory?: { id: number; name: string };
+}
+
+export interface Customer {
+  id: number;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+  /** Free-text remark carried by the production feed (description column). */
+  description?: string | null;
+  /** false when the backend has the customer disabled. */
+  enabled?: boolean;
+  loyaltyPoints?: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface OrderItem {
@@ -204,8 +281,34 @@ export interface DashboardData {
   };
 }
 
+const KNOWN_ROLES = ['WAITER', 'CHEF', 'CASHIER', 'ADMIN'] as const;
+
+/**
+ * Coerce whatever the server calls a role into the four the UI switches on.
+ * Backends spell it differently (lower case, spaces, an id, "Kitchen"), and an
+ * unknown value used to reach the role-gated tabs as `undefined`.
+ */
+function normalizeRole(value: unknown): StaffUser['role'] {
+  const raw = String(value ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if ((KNOWN_ROLES as readonly string[]).includes(raw)) return raw as StaffUser['role'];
+  if (raw.includes('WAITER') || raw.includes('SERV')) return 'WAITER';
+  if (raw.includes('CHEF') || raw.includes('KITCHEN') || raw.includes('COOK')) return 'CHEF';
+  if (raw.includes('CASH')) return 'CASHIER';
+  if (raw.includes('ADMIN') || raw.includes('MANAGER')) return 'ADMIN';
+  return 'WAITER';
+}
+
 class ApiService {
   private token: string | null = null;
+
+  // ─── Hosted-feed cache ─────────────────────────────────────────────────────
+  // The hosted backend serves the floor-plan, table-category and customer
+  // feeds that several read paths share (tables, sections, table detail) and
+  // that the home screen polls every few seconds. Concurrent callers share one
+  // in-flight request, and a route the server does not expose is remembered
+  // instead of re-probed on every refresh.
+  private feedCache = new Map<string, { at: number; data: unknown | null; status?: number }>();
+  private feedInFlight = new Map<string, Promise<ApiResponse<unknown>>>();
 
   constructor() {
     this.token = loadSession(getBaseUrl())?.token ?? null;
@@ -256,8 +359,58 @@ class ApiService {
     this.token = session?.token ?? null;
     this.abortAllRequests();
     this.invalidateMenuCache();
+    this.feedCache.clear();
+    this.feedInFlight.clear();
     removeStorageItemSync('smart_cafe_cached_tables');
     removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
+  }
+
+  /**
+   * GET `endpoint`, at most once per key across concurrent callers, and
+   * remember a route this server does not answer with JSON (404/405/redirect)
+   * for a minute so the home screen's refresh loop stops re-probing it.
+   * Successful responses are never cached — screens refetch them to confirm
+   * their own writes — the sharing only spans requests already in flight.
+   */
+  private async requestFeed<T>(key: string, endpoint: string): Promise<ApiResponse<T>> {
+    const miss = this.feedCache.get(key);
+    if (miss?.data === null && Date.now() - miss.at <= FEED_MISS_TTL_MS) {
+      return { success: false, error: `${endpoint} is not available on this server`, status: miss.status ?? 404 };
+    }
+
+    const inFlight = this.feedInFlight.get(key);
+    if (inFlight) return inFlight as Promise<ApiResponse<T>>;
+
+    const pending = this
+      .request<T>(endpoint, { requestKey: `feed:${key}` })
+      .then((res) => {
+        if (!res.success && !res.aborted && isRouteMissing(res)) {
+          this.feedCache.set(key, { at: Date.now(), data: null, status: res.status ?? 404 });
+        }
+        return res;
+      })
+      .finally(() => {
+        this.feedInFlight.delete(key);
+      });
+    this.feedInFlight.set(key, pending as Promise<ApiResponse<unknown>>);
+    return pending;
+  }
+
+  /** True when `key`'s route was probed and found missing on this server. */
+  private hasRouteMiss(key: string): boolean {
+    const miss = this.feedCache.get(key);
+    return miss?.data === null && Date.now() - miss.at <= FEED_MISS_TTL_MS;
+  }
+
+  /**
+   * Can this failure fall back to a hosted-only endpoint? Yes when the server
+   * answered at all — a network failure (status 0) or an aborted request
+   * means the next endpoint on the same host will fail the same way, and
+   * trying it would only double the wait. 401/403 are excluded: an expired
+   * session must reach the caller so the app can re-login.
+   */
+  private canFallback(res: ApiResponse<unknown>): boolean {
+    return !res.aborted && !!res.status && res.status !== 401 && res.status !== 403;
   }
 
   /** Latency + reachability probe against /health. Returns null if unreachable. */
@@ -450,25 +603,37 @@ class ApiService {
       }
       const data = await response.json().catch(() => ({} as any));
 
-      // Two success shapes exist: the local CafeOS backend wraps the payload
-      // as { success: true, data: { token, user } }, while /api/account/login
-      // (production) returns it flat:
-      //   { user_id, full_name, email, token, organisation_detail, ... }
-      const wrapped = data.data?.token && data.data?.user ? data.data : null;
-      const flat = data.token && (data.user_id != null || data.full_name) ? data : null;
-      const payload = data.success === false ? null : wrapped || flat;
-      if (response.ok && payload) {
-        const wrappedUser = payload.user || {};
+      // Three success shapes exist in the wild:
+      //   local backend  → { success: true, data: { token, user } }
+      //   /api/account/login (hosted) returns the session flat:
+      //                    { success: true, token, user_id, full_name, ... }
+      //   …or that same flat object nested once under data.
+      const inner = data.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
+      const payload =
+        data.success === false
+          ? null
+          : inner && (inner.token || inner.access_token)
+            ? inner
+            : data.token || data.access_token
+              ? data
+              : null;
+      const token: string | undefined =
+        payload?.token || payload?.access_token || payload?.accessToken || payload?.jwt;
+      if (response.ok && token) {
+        const rawUser = payload.user && typeof payload.user === 'object' ? payload.user : null;
         const user: StaffUser = {
-          id: wrappedUser.id ?? payload.user_id,
-          name: wrappedUser.name ?? payload.full_name ?? username,
-          email: (wrappedUser.email ?? payload.email) || username,
-          role: wrappedUser.role ?? payload.role ?? 'WAITER',
+          id: rawUser?.id ?? payload.user_id ?? payload.id,
+          name: rawUser?.name ?? payload.full_name ?? payload.name ?? username,
+          email: (rawUser?.email ?? payload.email) || username,
+          role: normalizeRole(rawUser?.role ?? payload.role),
         };
-        this.setToken(payload.token);
-        saveSession(this.baseUrl, { token: payload.token, user, username: username.trim() });
+        this.setToken(token);
+        saveSession(this.baseUrl, { token, user, username: username.trim() });
         this.invalidateMenuCache();
-        return { success: true, data: { token: payload.token, user }, status: response.status };
+        // Signing in can unlock session-gated feeds (/tablecategory/all) that
+        // were remembered as missing while anonymous — forget those misses.
+        this.feedCache.clear();
+        return { success: true, data: { token, user }, status: response.status };
       }
 
       return {
@@ -515,6 +680,8 @@ class ApiService {
     clearSession(this.baseUrl);
     this.setToken(null);
     this.invalidateMenuCache();
+    this.feedCache.clear();
+    this.feedInFlight.clear();
     removeStorageItemSync('smart_cafe_cached_tables');
     removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
     if (!token) {
@@ -535,28 +702,78 @@ class ApiService {
   }
 
   // ─── Sections ─────────────────────────────────────────────────────────────
+  /**
+   * Floor-plan tabs. A local CafeOS backend serves /sections directly; the
+   * hosted server has no such route, so sections are re-derived from the
+   * cafetable feed (one table category per section) and labelled from
+   * /tablecategory/all whenever the session can reach it.
+   */
   async getSections(): Promise<ApiResponse<Section[]>> {
-    return this.request<Section[]>('/sections');
+    const res = await this.requestFeed<Section[]>('sections', '/sections');
+    if (res.success) return res;
+    if (!this.canFallback(res)) return res;
+
+    const tables = await this.getTables();
+    if (!tables.success || !tables.data) return res;
+
+    const sections = sectionsFromTables(tables.data, await this.getTableSectionNames());
+    // Nothing to tab over: report the real failure instead of an empty list
+    // pretending to be a valid answer.
+    if (sections.length === 0) return res;
+    return { success: true, data: sections, status: res.status };
+  }
+
+  /** Section labels from /tablecategory/all — empty when the route is unavailable. */
+  private async getTableSectionNames(): Promise<Map<number, string>> {
+    const res = await this.requestFeed<RemoteTableCategory[]>('tablecategory', '/tablecategory/all');
+    if (!res.success || !res.data) return new Map();
+    return sectionNamesFromCategories(res.data);
   }
 
   // ─── Tables ───────────────────────────────────────────────────────────────
+  /**
+   * Tables for the floor plan. Primary source is the local backend's /tables
+   * (rich: capacity, occupancy, dining sessions); the hosted server answers
+   * with /cafetable/all instead, whose flat rows carry no session state — so
+   * those tables always render as free-to-seat.
+   */
   async getTables(sectionId?: number): Promise<ApiResponse<Table[]>> {
-    // requestKey coalesces concurrent table fetches — the newest wins, stale ones abort.
-    const res = await this.request<Table[]>('/tables', { requestKey: 'tables' });
-    if (res.success && res.data) {
-      const serialized = JSON.stringify(res.data);
-      if (getStorageItemSync('smart_cafe_cached_tables') !== serialized) {
-        setStorageItemSync('smart_cafe_cached_tables', serialized);
-        this.invalidateResolveCaches();
-      }
-      const filtered = sectionId ? res.data.filter((t) => t.sectionId === sectionId) : res.data;
-      return { success: true, data: filtered };
+    const res = await this.requestFeed<Table[]>('tables', '/tables');
+    if (res.success && res.data) return this.serveTables(res.data, sectionId);
+    if (!this.canFallback(res)) return res;
+
+    const feed = await this.requestFeed<RemoteCafeTable[]>('cafetable', '/cafetable/all');
+    if (feed.success && feed.data) return this.serveTables(feed.data.map(mapCafeTableToTable), sectionId);
+
+    // Both routes failed — surface whichever explains the situation: the feed
+    // error when /tables is simply not implemented here, the /tables error
+    // when it is (a 500 must not be blamed on a route that never existed).
+    return this.hasRouteMiss('tables') ? feedFailure<Table[]>(feed) : res;
+  }
+
+  /** Persist the snapshot the name resolvers read, then apply the section filter. */
+  private serveTables(tables: Table[], sectionId?: number): ApiResponse<Table[]> {
+    const serialized = JSON.stringify(tables);
+    if (getStorageItemSync('smart_cafe_cached_tables') !== serialized) {
+      setStorageItemSync('smart_cafe_cached_tables', serialized);
+      this.invalidateResolveCaches();
     }
-    return res;
+    const filtered = sectionId ? tables.filter((t) => t.sectionId === sectionId) : tables;
+    return { success: true, data: filtered };
   }
 
   async getTable(id: number): Promise<ApiResponse<TableDetail>> {
-    return this.request<TableDetail>(`/tables/${id}`);
+    const res = await this.request<TableDetail>(`/tables/${id}`);
+    if (res.success) return res;
+    if (!this.canFallback(res)) return res;
+
+    // Hosted server: table detail is a row of the cafetable feed. It carries
+    // no orders, so the detail comes back with an empty bill — enough for the
+    // order screens to render their "nothing here yet" state.
+    const tables = await this.getTables();
+    const found = tables.success ? tables.data?.find((t) => t.id === id) : undefined;
+    if (!found) return res;
+    return { success: true, data: { ...found, orders: [], activeOrders: [] }, status: res.status };
   }
 
   async updateTableStatus(id: number, status: string): Promise<ApiResponse<Table>> {
@@ -592,6 +809,39 @@ class ApiService {
   }
 
   /**
+   * Fresh menu straight from the server.
+   * Primary source is the flat production catalogue (/menu-item/all) folded
+   * with /menucategory/all for category names and order and the legacy explore
+   * feed for item order; servers that expose none of them (the local backend)
+   * fall back to the nested /menu payload. A host that never answered is not
+   * retried — a dead connection would only burn a second full timeout.
+   */
+  private async fetchServerMenu(requestKey?: string): Promise<ApiResponse<MenuCategory[]>> {
+    // requestFeed keeps concurrent menu loads on one in-flight request and,
+    // on a server without the flat feeds, remembers the miss so the fallback
+    // to /menu starts immediately instead of re-probing every refresh.
+    const [itemsRes, categoriesRes, exploreRes] = await Promise.all([
+      this.requestFeed<RemoteMenuItem[]>('menu-item', '/menu-item/all'),
+      this.requestFeed<RemoteMenuCategory[]>('menucategory', '/menucategory/all'),
+      this.requestFeed<RemoteMenuRow[]>('explore-menu', '/explore-menu/get-menu'),
+    ]);
+
+    if (itemsRes.success && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
+      const exploreRows = exploreRes.success && Array.isArray(exploreRes.data) ? exploreRes.data : [];
+      const entries = categoriesRes.success && Array.isArray(categoriesRes.data)
+        ? categoryEntriesFromCategories(categoriesRes.data)
+        : categoryEntriesFromExplore(exploreRows);
+      return { success: true, data: buildMenuCategories(itemsRes.data, entries, exploreRows), status: itemsRes.status };
+    }
+
+    if (itemsRes.status === 0 || itemsRes.aborted) {
+      return { success: false, error: itemsRes.error, status: itemsRes.status, aborted: itemsRes.aborted };
+    }
+
+    return this.request<MenuCategory[]>('/menu', { requestKey });
+  }
+
+  /**
    * Menu catalogue fetch.
    *  - default: serves the cached snapshot immediately and refreshes in the background
    *  - force:   skip the cache read and wait for a fresh response (order screens —
@@ -599,7 +849,7 @@ class ApiService {
    */
   async getMenu(options?: { force?: boolean; requestKey?: string }): Promise<ApiResponse<MenuCategory[]>> {
     const fetchFresh = async (): Promise<ApiResponse<MenuCategory[]>> => {
-      const res = await this.request<MenuCategory[]>('/menu', { requestKey: options?.requestKey });
+      const res = await this.fetchServerMenu(options?.requestKey);
       if (res.success && res.data) {
         setStorageItemSync('smart_cafe_cached_menu', JSON.stringify(res.data));
         this.invalidateResolveCaches();
@@ -625,6 +875,51 @@ class ApiService {
     }
 
     return fetchFresh();
+  }
+
+  // ─── Table Categories ─────────────────────────────────────────────────────
+  /** Table categories — session-gated on the hosted server (302 → its login page). */
+  async getTableCategories(): Promise<ApiResponse<TableCategory[]>> {
+    const res = await this.requestFeed<RemoteTableCategory[]>('tablecategory', '/tablecategory/all');
+    if (!res.success || !res.data) return feedFailure<TableCategory[]>(res);
+    return { success: true, data: res.data.map(mapTableCategory), status: res.status };
+  }
+
+  // ─── Cafe Tables ───────────────────────────────────────────────────────────
+  /** Flat floor-plan rows from /cafetable/all — no sessions, no capacity. */
+  async getCafeTables(): Promise<ApiResponse<CafeTable[]>> {
+    const res = await this.requestFeed<RemoteCafeTable[]>('cafetable', '/cafetable/all');
+    if (!res.success || !res.data) return feedFailure<CafeTable[]>(res);
+    return { success: true, data: res.data.map(mapCafeTable), status: res.status };
+  }
+
+  // ─── Menu Categories (flat list) ──────────────────────────────────────────
+  /** Category list from /menucategory/all — names + display order, no items. */
+  async getMenuCategories(): Promise<ApiResponse<MenuCategory[]>> {
+    const res = await this.requestFeed<RemoteMenuCategory[]>('menucategory', '/menucategory/all');
+    if (!res.success || !res.data) return feedFailure<MenuCategory[]>(res);
+    const categories = categoryEntriesFromCategories(res.data).filter((entry) => entry.visible);
+    return {
+      success: true,
+      status: res.status,
+      data: categories.map((entry) => ({ id: entry.id, name: entry.name, description: null })),
+    };
+  }
+
+  // ─── Menu Items (flat list) ────────────────────────────────────────────────
+  /** Flat catalogue from /menu-item/all — the same rows the menu browser folds. */
+  async getMenuItems(): Promise<ApiResponse<MenuItem[]>> {
+    const res = await this.requestFeed<RemoteMenuItem[]>('menu-item', '/menu-item/all');
+    if (!res.success || !res.data) return feedFailure<MenuItem[]>(res);
+    return { success: true, data: res.data.map((row) => mapMenuItem(row)), status: res.status };
+  }
+
+  // ─── Customers ─────────────────────────────────────────────────────────────
+  /** Customer directory from /customer/all — the order flow's picker source. */
+  async getCustomers(): Promise<ApiResponse<Customer[]>> {
+    const res = await this.requestFeed<RemoteCustomer[]>('customers', '/customer/all');
+    if (!res.success || !res.data) return feedFailure<Customer[]>(res);
+    return { success: true, data: res.data.map(mapCustomer), status: res.status };
   }
 
   // ─── Orders ────────────────────────────────────────────────────────────────
@@ -667,6 +962,7 @@ class ApiService {
   async createOrder(data: {
     tableId: number;
     waiterId?: number;
+    customerId?: number;
     customerNotes?: string;
     clientRequestId?: string;
     items: { menuItemId: number; quantity: number; price: number; notes?: string }[];

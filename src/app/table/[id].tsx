@@ -15,7 +15,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Hoverable } from '@/components/Hoverable';
-import { api, MenuItem, MenuCategory } from '@/services/api';
+import { api, Customer, MenuItem, MenuCategory } from '@/services/api';
 import { orderApi } from '@/services/orderApi';
 import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getGridGap } from '@/utils/responsive';
 import { webAlert } from '@/utils/webAlert';
@@ -56,11 +56,21 @@ export default function PlaceOrderScreen() {
   const [cashierNotes, setCashierNotes]   = useState('');
   const [remarkTab, setRemarkTab] = useState<'KITCHEN' | 'COUNTER' | 'CASHIER'>('KITCHEN');
 
+  // ─── Customer (optional — from GET /api/customer/all) ─────────────────────
+  const [customers, setCustomers]           = useState<Customer[]>([]);
+  const [customerQuery, setCustomerQuery]   = useState('');
+  const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+
   // ─── Fetch table + menu ─────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
     try {
       setError(null);
-      const { table: tableRes, menu: menuRes, settings: settingsRes } = await orderApi.getPlaceOrderData(Number(id));
+      const [{ table: tableRes, menu: menuRes, settings: settingsRes }, customersRes] = await Promise.all([
+        orderApi.getPlaceOrderData(Number(id)),
+        // The picker is optional: a server without the customer feed must not
+        // block the order screen, so its failure is simply an empty list.
+        api.getCustomers().catch(() => null),
+      ]);
       if (tableRes.success && tableRes.data) setTable(tableRes.data);
       else setError(tableRes.error || 'Failed to load table');
       if (menuRes.success && menuRes.data) {
@@ -81,6 +91,10 @@ export default function PlaceOrderScreen() {
       if (settingsRes.success && settingsRes.data) {
         const symbol = settingsRes.data.currencySymbol || 'NPR';
         setCurrencySymbol(symbol === '$' ? 'NPR' : symbol);
+      }
+      if (customersRes?.success && customersRes.data) {
+        // Disabled rows are directory leftovers — they can never take an order.
+        setCustomers(customersRes.data.filter((c) => c.enabled !== false));
       }
     } catch {
       setError('Failed to connect to server');
@@ -111,6 +125,19 @@ export default function PlaceOrderScreen() {
     }
     return items;
   }, [allMenuItems, activeCategoryId, searchQuery, menu]);
+
+  // ─── Customer search ────────────────────────────────────────────────────────
+  const matchedCustomers = useMemo(() => {
+    const query = customerQuery.trim().toLowerCase();
+    if (!query) return [];
+    return customers
+      .filter((c) =>
+        c.name.toLowerCase().includes(query) ||
+        (c.phone || '').includes(query) ||
+        (c.email || '').toLowerCase().includes(query)
+      )
+      .slice(0, 6);
+  }, [customers, customerQuery]);
 
   // ─── Cart helpers ─────────────────────────────────────────────────────────────
   const handleSelectItem = (item: MenuItem) => {
@@ -158,7 +185,7 @@ export default function PlaceOrderScreen() {
         counterNotes ? `COUNTER: ${counterNotes}` : '',
         cashierNotes ? `CASHIER: ${cashierNotes}` : '',
       ].filter(Boolean).join('\n');
-      const cartKey = JSON.stringify([Number(id), combinedNotes, itemsPayload]);
+      const cartKey = JSON.stringify([Number(id), combinedNotes, selectedCustomer?.id ?? null, itemsPayload]);
       if (submissionIdRef.current?.cartKey !== cartKey) {
         submissionIdRef.current = {
           cartKey,
@@ -167,6 +194,9 @@ export default function PlaceOrderScreen() {
       }
       const response = await orderApi.createOrder({
         tableId: Number(id),
+        // Optional walk-in is omitted entirely so a backend that requires the
+        // field to be absent (rather than null) never rejects the order.
+        customerId: selectedCustomer?.id,
         customerNotes: combinedNotes,
         clientRequestId: submissionIdRef.current.requestId,
         items: itemsPayload,
@@ -177,6 +207,8 @@ export default function PlaceOrderScreen() {
         setKitchenNotes('');
         setCounterNotes('');
         setCashierNotes('');
+        setSelectedCustomer(null);
+        setCustomerQuery('');
         const goToOrders = () => {
           switchMainTab('orders');
           router.dismissTo('/' as any);
@@ -456,6 +488,72 @@ export default function PlaceOrderScreen() {
           </View>
         </View>
 
+        {/* ─── Customer (optional) ─── */}
+        <View style={styles.customerCard}>
+          <View style={styles.customerHeader}>
+            <MaterialIcons name="person-outline" size={18} color={THEME_ORANGE} />
+            <Text style={styles.customerTitle}>Customer</Text>
+            <Text style={styles.customerHint}>optional</Text>
+            {selectedCustomer && (
+              <Hoverable
+                style={styles.customerClear}
+                hoverOpacity={0.7}
+                onPress={() => { setSelectedCustomer(null); setCustomerQuery(''); }}
+              >
+                <MaterialIcons name="close" size={16} color="#64748B" />
+              </Hoverable>
+            )}
+          </View>
+
+          {selectedCustomer ? (
+            <View style={styles.customerChip}>
+              <MaterialIcons name="check-circle" size={16} color={THEME_ORANGE} />
+              <Text style={styles.customerChipName}>{selectedCustomer.name}</Text>
+              {!!selectedCustomer.phone && <Text style={styles.customerChipMeta}>{selectedCustomer.phone}</Text>}
+            </View>
+          ) : (
+            <>
+              <View style={styles.customerSearchBox}>
+                <MaterialIcons name="search" size={18} color="#94A3B8" />
+                <TextInput
+                  style={styles.customerSearch}
+                  placeholder={customers.length > 0 ? 'Search customer by name or phone…' : 'No customers on this server'}
+                  placeholderTextColor="#94A3B8"
+                  autoCorrect={false}
+                  value={customerQuery}
+                  onChangeText={setCustomerQuery}
+                  editable={customers.length > 0}
+                />
+              </View>
+
+              {customerQuery.trim().length > 0 && (
+                matchedCustomers.length > 0 ? (
+                  <View style={styles.customerList}>
+                    {matchedCustomers.map((c) => (
+                      <TouchableOpacity
+                        key={c.id}
+                        style={styles.customerOption}
+                        activeOpacity={0.7}
+                        onPress={() => {
+                          setSelectedCustomer(c);
+                          setCustomerQuery('');
+                        }}
+                      >
+                        <Text style={styles.customerOptionName} numberOfLines={1}>{c.name}</Text>
+                        <Text style={styles.customerOptionMeta} numberOfLines={1}>
+                          {c.phone || c.email || c.address || `Customer #${c.id}`}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                ) : (
+                  <Text style={styles.customerEmpty}>No matching customer</Text>
+                )
+              )}
+            </>
+          )}
+        </View>
+
         {/* Order Now Button */}
         <Hoverable
           style={[styles.orderNowBtn, (submitting || cartList.length === 0) && styles.disabledBtn]}
@@ -595,6 +693,22 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   remarkTabTextActive: { color: '#FFFFFF', fontWeight: '800' },
   remarkTable: { backgroundColor: '#FFFFFF', borderRadius: getBorderRadius(bp.breakpoint, 'md'), borderWidth: 1, borderColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md') },
   remarkInput: { backgroundColor: '#F8FAFC', borderRadius: getBorderRadius(bp.breakpoint, 'sm'), borderWidth: 1, borderColor: '#E2E8F0', padding: getSpacing(bp.breakpoint, 'md'), height: moderateScale(110, 0.5, bp.breakpoint), textAlignVertical: 'top', fontSize: getFontSize(bp.breakpoint, 'sm'), color: '#0F172A' },
+
+  customerCard:   { backgroundColor: '#FFFFFF', borderRadius: getBorderRadius(bp.breakpoint, 'md'), borderWidth: 1, borderColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md'), marginBottom: getSpacing(bp.breakpoint, 'md') },
+  customerHeader: { flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'xs'), marginBottom: getSpacing(bp.breakpoint, 'sm') },
+  customerTitle:  { fontSize: getFontSize(bp.breakpoint, 'md'), fontWeight: '800', color: '#0F172A' },
+  customerHint:   { flex: 1, fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#94A3B8' },
+  customerClear:  { width: moderateScale(24, 0.5, bp.breakpoint), height: moderateScale(24, 0.5, bp.breakpoint), borderRadius: moderateScale(12, 0.5, bp.breakpoint), backgroundColor: '#F1F5F9', alignItems: 'center', justifyContent: 'center' },
+  customerChip:   { flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'xs'), backgroundColor: '#FFF3E0', borderWidth: 1, borderColor: THEME_ORANGE, borderRadius: getBorderRadius(bp.breakpoint, 'lg'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm') },
+  customerChipName:{ fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '800', color: '#0F172A', flexShrink: 1 },
+  customerChipMeta:{ fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#64748B' },
+  customerSearchBox:{ flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'sm'), backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#E2E8F0', borderRadius: getBorderRadius(bp.breakpoint, 'md'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), height: moderateScale(44, 0.5, bp.breakpoint) },
+  customerSearch: { flex: 1, fontSize: getFontSize(bp.breakpoint, 'sm'), color: '#0F172A' },
+  customerList:   { marginTop: getSpacing(bp.breakpoint, 'xs'), borderWidth: 1, borderColor: '#E2E8F0', borderRadius: getBorderRadius(bp.breakpoint, 'md'), backgroundColor: '#FFFFFF', overflow: 'hidden' },
+  customerOption: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: getSpacing(bp.breakpoint, 'sm'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm'), borderBottomWidth: 1, borderBottomColor: '#F1F5F9' },
+  customerOptionName:{ fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '700', color: '#0F172A', flexShrink: 1 },
+  customerOptionMeta:{ fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#64748B' },
+  customerEmpty:  { marginTop: getSpacing(bp.breakpoint, 'xs'), fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#94A3B8' },
 
   orderNowBtn:    { backgroundColor: BRAND_ORANGE, borderRadius: getBorderRadius(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'md'), alignItems: 'center', justifyContent: 'center', elevation: 3 },
   orderNowBtnText:{ color: '#FFFFFF', fontSize: getFontSize(bp.breakpoint, 'lg'), fontWeight: '900' },

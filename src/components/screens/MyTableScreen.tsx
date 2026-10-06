@@ -434,9 +434,9 @@ export function MyTableScreen({
             hoverOpacity={0.7}
           >
             <Image
-              source={require('../../../assets/images/profile.png')}
+              source={require('../../../assets/images/profile.jpg')}
               style={styles.profileImage}
-              resizeMode="cover"
+              resizeMode="contain"
             />
           </Hoverable>
         </View>

@@ -302,9 +302,9 @@ export function DashboardScreen({
             </Hoverable>
             <Hoverable style={styles.headerIconBtn} onPress={onNavigateProfile} hoverOpacity={0.7}>
               <Image
-                source={require('../../../assets/images/profile.png')}
+                source={require('../../../assets/images/profile.jpg')}
                 style={{ width: 28, height: 28, borderRadius: 14 }}
-                resizeMode="cover"
+                resizeMode="contain"
               />
             </Hoverable>
           </View>

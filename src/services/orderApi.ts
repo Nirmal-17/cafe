@@ -80,6 +80,7 @@ export const orderApi = {
   createOrder(data: {
     tableId: number;
     waiterId?: number;
+    customerId?: number;
     customerNotes?: string;
     clientRequestId?: string;
     items: { menuItemId: number; quantity: number; price: number; notes?: string }[];
