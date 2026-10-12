@@ -66,10 +66,6 @@
     background-color: #1A2A1A !important;
   }
   
-  .table-card-occupied:hover {
-    border-color: #D32F2F !important;
-  }
-  
   .table-card-reserved:hover {
     border-color: var(--brand-orange) !important;
   }

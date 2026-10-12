@@ -7,18 +7,11 @@
     "icon": "./assets/images/favicon.png",
     "scheme": "cafeos",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.leadingedge.cafeos",
       "buildNumber": "1",
-      "icon": "./assets/images/favicon.png",
-      "splash": {
-        "backgroundColor": "#208AEF",
-        "image": "./assets/images/favicon.png",
-        "imageWidth": 76,
-        "resizeMode": "contain"
-      }
+      "icon": "./assets/images/favicon.png"
     },
     "android": {
       "package": "com.leadingedge.cafeos",
@@ -26,13 +19,7 @@
         "backgroundColor": "#208AEF",
         "foregroundImage": "./assets/images/favicon.png"
       },
-      "predictiveBackGestureEnabled": false,
-      "splash": {
-        "backgroundColor": "#208AEF",
-        "image": "./assets/images/favicon.png",
-        "imageWidth": 76,
-        "resizeMode": "contain"
-      }
+      "predictiveBackGestureEnabled": false
     },
     "web": {
       "output": "static",
@@ -52,7 +39,8 @@
       ],
       "expo-image",
       "expo-web-browser",
-      "expo-audio"
+      "expo-audio",
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": true

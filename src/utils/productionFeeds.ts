@@ -7,6 +7,8 @@
 // Deliberately free of I/O so it can be reasoned about alone.
 
 import type { CafeTable, Customer, Section, Table, TableCategory } from '@/services/api';
+import { classifyTableServiceType } from '@/utils/diningArea';
+import { inferSectionFromTableName } from '@/utils/tableSections';
 
 /**
  * No feed carries a seating capacity, but every floor-plan tile renders one.
@@ -53,9 +55,8 @@ const text = (value: unknown): string => String(value ?? '').trim();
 export const tableLabel = (row: RemoteCafeTable): string =>
   text(row.display_name) || text(row.name) || `Table ${row.table_id}`;
 
-/** The hosted feed has no occupancy state — only reservation + activation. */
+/** Reserve-only: the hosted feed carries no occupancy state — only reservation. */
 const tableStatus = (row: RemoteCafeTable): Table['status'] => {
-  if (row.is_active === false) return 'CLEANING';
   if (row.is_reserved === true) return 'RESERVED';
   return 'AVAILABLE';
 };
@@ -74,13 +75,15 @@ export function mapCafeTable(row: RemoteCafeTable): CafeTable {
 
 /** Flat cafetable row → the Table model the floor plan and order screens use. */
 export function mapCafeTableToTable(row: RemoteCafeTable): Table {
+  const tableNum = tableLabel(row);
   return {
     id: num(row.table_id),
     sectionId: num(row.table_category_id),
-    tableNumber: tableLabel(row),
+    tableNumber: tableNum,
     capacity: DEFAULT_TABLE_CAPACITY,
     status: tableStatus(row),
     is_reserved: row.is_reserved === true,
+    serviceType: classifyTableServiceType(tableNum),
     // The hosted feed carries no dining sessions, so the tile renders as
     // unassigned — same as a table nobody has seated yet on a CafeOS server.
     activeSession: null,
@@ -90,7 +93,10 @@ export function mapCafeTableToTable(row: RemoteCafeTable): Table {
 /**
  * Table rows → Section[] for the floor-plan tabs, grouped by table category.
  * `names` (from /tablecategory/all when the session can reach it) labels the
- * groups; anything unnamed keeps a stable "Section {id}" label.
+ * groups; anything unnamed is inferred from the tables' own labels
+ * (IN→Indoor, R→Roof, … — see inferSectionFromTableName) so the tabs read
+ * Indoor / Roof / Cabin / Hall / Garden / Pool / Room / Outdoor instead of
+ * the "Section {id}" placeholders the old code produced.
  */
 export function sectionsFromTables(tables: Table[], names: Map<number, string> = new Map()): Section[] {
   const order: number[] = [];
@@ -99,12 +105,35 @@ export function sectionsFromTables(tables: Table[], names: Map<number, string> =
     if (!Number.isFinite(id)) continue;
     if (!order.includes(id)) order.push(id);
   }
-  return order.sort((a, b) => a - b).map((id) => ({
-    id,
-    name: names.get(id) || `Section ${id}`,
-    description: null,
-    status: 'ACTIVE' as const,
-  }));
+  return order.sort((a, b) => a - b).map((id) => {
+    const known = (names.get(id) || '').trim();
+    if (known && !/^section\s+\d+$/i.test(known)) {
+      return { id, name: known, description: null, status: 'ACTIVE' as const };
+    }
+    // No backend name — infer from the category's own tables by majority vote,
+    // so one odd table (e.g. a single O6 among IN tables, or vice versa) can't
+    // mislabel the whole tab the way a first-sample pick could.
+    const votes = new Map<string, number>();
+    for (const t of tables) {
+      if (num(t.sectionId) !== id) continue;
+      const inferred = inferSectionFromTableName(t.tableNumber);
+      if (inferred) votes.set(inferred, (votes.get(inferred) ?? 0) + 1);
+    }
+    let best: string | null = null;
+    let bestCount = 0;
+    for (const [name, count] of votes) {
+      if (count > bestCount) {
+        best = name;
+        bestCount = count;
+      }
+    }
+    return {
+      id,
+      name: best || `Section ${id}`,
+      description: null,
+      status: 'ACTIVE' as const,
+    };
+  });
 }
 
 /** Category-name rows → the lookup used by sectionsFromTables(). */

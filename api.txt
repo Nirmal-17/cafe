@@ -1,6 +1,6 @@
 CafeOS API Documentation & Routes
-Base URL Default: https://cafe.leadingedge.com.np
-All routes are prefixed with /api/... (e.g. https://cafe.leadingedge.com.np/api/...)
+Base URL Default: https://cafeos.leadingedge.com.np
+All routes are prefixed with /api/... (e.g. https://cafeos.leadingedge.com.np/api/...)
 
 ---
 
@@ -234,7 +234,7 @@ All routes are prefixed with /api/... (e.g. https://cafe.leadingedge.com.np/api/
     {
       "success": true,
       "data": {
-        "qrUrl": "https://cafe.leadingedge.com.np/qr-code.png"
+        "qrUrl": "https://cafeos.leadingedge.com.np/qr-code.png"
       }
     }
     ```

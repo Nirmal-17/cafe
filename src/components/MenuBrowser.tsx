@@ -15,6 +15,7 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { api, MenuItem, MenuCategory } from '../services/api';
+import { sortMenuItemsByCanonicalOrder } from '@/utils/orderedMenuItems';
 import { Hoverable } from '@/components/Hoverable';
 
 const BRAND_PRIMARY = '#073F78';
@@ -116,23 +117,7 @@ const MenuItemCard = memo(function MenuItemCard({
             />
           )}
         </View>
-        <View style={styles.itemMetaRow}>
-          <View
-            style={[
-              styles.stockPill,
-              { backgroundColor: item.available ? '#ECFDF5' : '#FEF2F2' },
-            ]}
-          >
-            <Text
-              style={[
-                styles.stockPillText,
-                { color: item.available ? COLOR_SUCCESS : COLOR_ERROR },
-              ]}
-            >
-              {item.available ? 'In Stock' : 'Out of Stock'}
-            </Text>
-          </View>
-        </View>
+        
       </View>
 
       <View style={styles.itemCardRight}>
@@ -250,8 +235,12 @@ export const MenuBrowser = memo(function MenuBrowser({
         }
         matched.push({ item, categoryName: cat.name });
       }
-      if (matched.length > 0) {
-        result.push({ categoryId: cat.id, title: cat.name, data: matched });
+      // Sort matched items by canonical place-order sequence
+      const sortedMatched = sortMenuItemsByCanonicalOrder(
+        matched.map((m) => m.item)
+      ).map((item, idx) => ({ item, categoryName: cat.name }));
+      if (sortedMatched.length > 0) {
+        result.push({ categoryId: cat.id, title: cat.name, data: sortedMatched });
       }
     }
     return result;
@@ -505,16 +494,7 @@ export const MenuBrowser = memo(function MenuBrowser({
                     <MaterialIcons name="restaurant-menu" size={12} color="#fff" />
                     <Text style={styles.modalHeroChipText}>{selectedItemCategory}</Text>
                   </View>
-                  <View
-                    style={[
-                      styles.modalHeroChip,
-                      { backgroundColor: selectedItem.available ? '#065F46' : '#7F1D1D' },
-                    ]}
-                  >
-                    <Text style={styles.modalHeroChipText}>
-                      {selectedItem.available ? 'In Stock' : 'Out of Stock'}
-                    </Text>
-                  </View>
+                  
                 </View>
                 <Text style={styles.modalHeroPrice}>
                   {currencySymbol} {Number(selectedItem.price).toFixed(2)}
@@ -800,15 +780,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
     gap: 6,
   },
-  stockPill: {
-    borderRadius: 6,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-  },
-  stockPillText: {
-    fontSize: 10,
-    fontWeight: '700',
-  },
+  
   itemCardRight: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -15,31 +15,39 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Hoverable } from '@/components/Hoverable';
-import { api, Customer, MenuItem, MenuCategory } from '@/services/api';
+import { api, MenuItem, MenuCategory, isRouteMissing } from '@/services/api';
 import { orderApi } from '@/services/orderApi';
+import { loadSession } from '@/utils/sessions';
 import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getGridGap } from '@/utils/responsive';
 import { webAlert } from '@/utils/webAlert';
-import { switchMainTab } from '@/utils/mainTab';
+import { requestMainRefresh, switchMainTab } from '@/utils/mainTab';
 import { notifyPrintProceeded } from '@/utils/printProceededToast';
+import { goBackOrHome } from '@/utils/navigation';
+import { assignReservationId, useReservationId } from '@/utils/reservations';
+import { filterAndOrderMenuItems, CANONICAL_CATEGORIES } from '@/utils/orderedMenuItems';
 
 const THEME_ORANGE = '#FF6D00';
 const BRAND_ORANGE = '#FF6D00';
 const BORDER_COLOR = '#E2E8F0';
+const TEXT_MUTED = '#64748B';
 
 export default function PlaceOrderScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
-  const { breakpoint } = useResponsive();
+  const responsive = useResponsive();
+  const { breakpoint, width, height } = responsive;
 
   // Android hardware back button
   useEffect(() => {
     if (Platform.OS === 'web') return; // BackHandler is Android-only
-    const handler = () => { router.back(); return true; };
+    const handler = () => { goBackOrHome(); return true; };
     const sub = BackHandler.addEventListener('hardwareBackPress', handler);
     return () => sub.remove();
   }, [router]);
 
   const [table, setTable]       = useState<any>(null);
+  // RES-#### id this table carries while it is reserved / being served.
+  const reservationId           = useReservationId(Number(id));
   const [menu, setMenu]         = useState<MenuCategory[]>([]);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState<string | null>(null);
@@ -56,29 +64,19 @@ export default function PlaceOrderScreen() {
   const [cashierNotes, setCashierNotes]   = useState('');
   const [remarkTab, setRemarkTab] = useState<'KITCHEN' | 'COUNTER' | 'CASHIER'>('KITCHEN');
 
-  // ─── Customer (optional — from GET /api/customer/all) ─────────────────────
-  const [customers, setCustomers]           = useState<Customer[]>([]);
-  const [customerQuery, setCustomerQuery]   = useState('');
-  const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
-
   // ─── Fetch table + menu ─────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
     try {
       setError(null);
-      const [{ table: tableRes, menu: menuRes, settings: settingsRes }, customersRes] = await Promise.all([
-        orderApi.getPlaceOrderData(Number(id)),
-        // The picker is optional: a server without the customer feed must not
-        // block the order screen, so its failure is simply an empty list.
-        api.getCustomers().catch(() => null),
-      ]);
+      const { table: tableRes, menu: menuRes, settings: settingsRes } = await orderApi.getPlaceOrderData(Number(id));
       if (tableRes.success && tableRes.data) setTable(tableRes.data);
       else setError(tableRes.error || 'Failed to load table');
       if (menuRes.success && menuRes.data) {
         setMenu(menuRes.data);
         // Drop cart lines whose menu item no longer exists on the server
-        // (deleted item or a stale/demo menu snapshot) so they can never be
-        // submitted as "Menu item not found".
-        const validIds = new Set(menuRes.data.flatMap((c) => (c.items || []).map((i) => i.id)));
+        // or canonical list so they can never be submitted as "Menu item not found".
+        const validItems = filterAndOrderMenuItems(menuRes.data.flatMap((c) => (c.items || [])));
+        const validIds = new Set(validItems.map((i) => i.id));
         setSelectedItems((prev) => {
           if (prev.size === 0) return prev;
           const next = new Map(prev);
@@ -91,10 +89,6 @@ export default function PlaceOrderScreen() {
       if (settingsRes.success && settingsRes.data) {
         const symbol = settingsRes.data.currencySymbol || 'NPR';
         setCurrencySymbol(symbol === '$' ? 'NPR' : symbol);
-      }
-      if (customersRes?.success && customersRes.data) {
-        // Disabled rows are directory leftovers — they can never take an order.
-        setCustomers(customersRes.data.filter((c) => c.enabled !== false));
       }
     } catch {
       setError('Failed to connect to server');
@@ -109,35 +103,59 @@ export default function PlaceOrderScreen() {
     return () => { mounted = false; };
   }, [fetchData]);
 
+  // Dynamic grid metrics: compute column count and card width from actual window
+  // dimensions so the menu grid adapts to any screen size.
+  const gridMetrics = useMemo(() => {
+    const gap = getGridGap(breakpoint);
+    const pagePad = getSpacing(breakpoint, 'md') * 2;
+    const cardPad = getSpacing(breakpoint, 'sm') * 2;
+    const available = Math.max(160, width - pagePad - cardPad);
+    const minCard = getResponsiveValue(
+      { xs: 104, sm: 110, md: 140, lg: 150, xl: 160 },
+      breakpoint,
+    );
+    const columns = Math.max(2, Math.min(8, Math.floor((available + gap) / (minCard + gap))));
+    const cardWidth = Math.floor((available - gap * (columns - 1)) / columns);
+    const gridHeight = Math.max(300, Math.min(Math.round(height * 0.48), 560));
+    return { columns, cardWidth, gridHeight, gap };
+  }, [width, height, breakpoint]);
+
+  // Reserve-only: a reserved table keeps its RES-#### id even when the order
+  // pad is opened directly (deep link), without going through Take Order.
+  useEffect(() => {
+    const status = String((table as { status?: unknown } | null)?.status ?? '').toUpperCase();
+    if (status === 'RESERVED' || (table as { is_reserved?: boolean } | null)?.is_reserved === true) {
+      assignReservationId(Number(id));
+    }
+  }, [table, id]);
+
   // ─── Derived lists ───────────────────────────────────────────────────────────
-  const allMenuItems = useMemo(() => menu.flatMap((c) => c.items || []), [menu]);
+  const allMenuItems = useMemo(() => {
+    const raw = menu.flatMap((c) => c.items || []);
+    return filterAndOrderMenuItems(raw);
+  }, [menu]);
+
+  const availableCategories = useMemo(() => {
+    const categoryIds = new Set(allMenuItems.map((i) => i.categoryId));
+    const source = menu && menu.length > 0 ? menu : CANONICAL_CATEGORIES;
+    return source.filter((c) => categoryIds.has(c.id));
+  }, [menu, allMenuItems]);
 
   const filteredMenuItems = useMemo(() => {
-    let items = allMenuItems;
+    // Items the server marks unavailable (api.txt §4 `available`) cannot be
+    // ordered — keep them out of the picker instead of failing at submit.
+    let items = allMenuItems.filter((i) => i.available !== false);
     if (activeCategoryId !== null) items = items.filter((i) => i.categoryId === activeCategoryId);
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       items = items.filter((i) =>
         i.name.toLowerCase().includes(q) ||
         (i.description || '').toLowerCase().includes(q) ||
-        (menu.find((c) => c.id === i.categoryId)?.name || '').toLowerCase().includes(q)
+        (availableCategories.find((c) => c.id === i.categoryId)?.name || '').toLowerCase().includes(q)
       );
     }
     return items;
-  }, [allMenuItems, activeCategoryId, searchQuery, menu]);
-
-  // ─── Customer search ────────────────────────────────────────────────────────
-  const matchedCustomers = useMemo(() => {
-    const query = customerQuery.trim().toLowerCase();
-    if (!query) return [];
-    return customers
-      .filter((c) =>
-        c.name.toLowerCase().includes(query) ||
-        (c.phone || '').includes(query) ||
-        (c.email || '').toLowerCase().includes(query)
-      )
-      .slice(0, 6);
-  }, [customers, customerQuery]);
+  }, [allMenuItems, activeCategoryId, searchQuery, availableCategories]);
 
   // ─── Cart helpers ─────────────────────────────────────────────────────────────
   const handleSelectItem = (item: MenuItem) => {
@@ -185,18 +203,19 @@ export default function PlaceOrderScreen() {
         counterNotes ? `COUNTER: ${counterNotes}` : '',
         cashierNotes ? `CASHIER: ${cashierNotes}` : '',
       ].filter(Boolean).join('\n');
-      const cartKey = JSON.stringify([Number(id), combinedNotes, selectedCustomer?.id ?? null, itemsPayload]);
+      const cartKey = JSON.stringify([Number(id), combinedNotes, itemsPayload]);
       if (submissionIdRef.current?.cartKey !== cartKey) {
         submissionIdRef.current = {
           cartKey,
           requestId: orderApi.generateClientRequestId('order'),
         };
       }
+      // api.txt §5: POST /api/orders carries the waiter taking the order —
+      // the signed-in staff user is the authority for that id.
+      const waiterId = loadSession(api.getBaseUrl())?.user?.id;
       const response = await orderApi.createOrder({
         tableId: Number(id),
-        // Optional walk-in is omitted entirely so a backend that requires the
-        // field to be absent (rather than null) never rejects the order.
-        customerId: selectedCustomer?.id,
+        waiterId: typeof waiterId === 'number' ? waiterId : undefined,
         customerNotes: combinedNotes,
         clientRequestId: submissionIdRef.current.requestId,
         items: itemsPayload,
@@ -207,10 +226,13 @@ export default function PlaceOrderScreen() {
         setKitchenNotes('');
         setCounterNotes('');
         setCashierNotes('');
-        setSelectedCustomer(null);
-        setCustomerQuery('');
-        const goToOrders = () => {
-          switchMainTab('orders');
+        // After the order is taken the waiter lands on the Menu tab (menu
+        // items list) ready for the next order. dismissTo also drops the
+        // place-order screen from the stack, so Back never returns to an
+        // emptied cart.
+        const goToMenuItems = () => {
+          requestMainRefresh();
+          switchMainTab('menu');
           router.dismissTo('/' as any);
         };
         const createdOrder = response.data;
@@ -219,16 +241,23 @@ export default function PlaceOrderScreen() {
           {
             text: 'No',
             style: 'cancel',
-            onPress: goToOrders,
+            onPress: goToMenuItems,
           },
           {
             text: 'Yes',
             onPress: () => {
               notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
-              goToOrders();
+              goToMenuItems();
             },
           },
         ]);
+      } else if (response.status === 404 && isRouteMissing(response)) {
+        // Read-only server: /orders does not exist there at all, so no menu
+        // reload can fix it. Say that plainly and keep the cart intact.
+        webAlert(
+          'Order Not Sent',
+          'This server has no order API, so nothing was sent. Your cart is still here — set the correct server URL in Profile → Configure Server URL, then tap Order Now again.'
+        );
       } else if (response.status === 400 || response.status === 404) {
         // The menu on screen no longer matches the backend (item deleted,
         // price changed, stale or demo snapshot). Reload it and let the
@@ -250,14 +279,17 @@ export default function PlaceOrderScreen() {
   };
 
   // Create responsive styles
-  const styles = createStyles({ breakpoint, width: 0, height: 0, isTablet: breakpoint === 'md' || breakpoint === 'lg' || breakpoint === 'xl', isDesktop: breakpoint === 'lg' || breakpoint === 'xl', isLandscape: false } as any);
+  const styles = useMemo(
+    () => createStyles(responsive),
+    [responsive],
+  );
 
   // ─── Loading / Error ────────────────────────────────────────────────────────
   if (loading) {
     return (
       <SafeAreaView style={styles.root} edges={['top']}>
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+          <TouchableOpacity onPress={goBackOrHome} style={styles.backBtn}>
             <MaterialIcons name="arrow-back" size={24} color="#fff" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Loading…</Text>
@@ -275,7 +307,7 @@ export default function PlaceOrderScreen() {
     return (
       <SafeAreaView style={styles.root} edges={['top']}>
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+          <TouchableOpacity onPress={goBackOrHome} style={styles.backBtn}>
             <MaterialIcons name="arrow-back" size={24} color="#fff" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Error</Text>
@@ -301,10 +333,19 @@ export default function PlaceOrderScreen() {
     <SafeAreaView style={styles.root} edges={['top']}>
       {/* ─── Header ─── */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+        <TouchableOpacity onPress={goBackOrHome} style={styles.backBtn}>
           <MaterialIcons name="arrow-back" size={24} color="#FFFFFF" />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{tableName} — Place Order</Text>
+        <View style={styles.headerCenter}>
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {tableName} — Place Order
+          </Text>
+          {reservationId ? (
+            <View style={styles.headerResBadge}>
+              <Text style={styles.headerResBadgeText}>{reservationId}</Text>
+            </View>
+          ) : null}
+        </View>
         <View style={{ width: 40 }} />
       </View>
 
@@ -351,7 +392,7 @@ export default function PlaceOrderScreen() {
               >
                 <Text style={[styles.chipText, activeCategoryId === null && styles.chipTextActive]}>All</Text>
               </TouchableOpacity>
-              {menu.map((cat) => (
+              {availableCategories.map((cat) => (
                 <TouchableOpacity
                   key={cat.id}
                   style={[styles.chip, cat.id === activeCategoryId && styles.chipActive]}
@@ -376,7 +417,11 @@ export default function PlaceOrderScreen() {
                     return (
                       <TouchableOpacity
                         key={item.id}
-                        style={[styles.menuCard, qty > 0 && styles.menuCardSelected]}
+                        style={[
+                          styles.menuCard,
+                          { width: gridMetrics.cardWidth },
+                          qty > 0 && styles.menuCardSelected,
+                       ]}
                         onPress={() => handleSelectItem(item)}
                         activeOpacity={0.75}
                       >
@@ -488,88 +533,29 @@ export default function PlaceOrderScreen() {
           </View>
         </View>
 
-        {/* ─── Customer (optional) ─── */}
-        <View style={styles.customerCard}>
-          <View style={styles.customerHeader}>
-            <MaterialIcons name="person-outline" size={18} color={THEME_ORANGE} />
-            <Text style={styles.customerTitle}>Customer</Text>
-            <Text style={styles.customerHint}>optional</Text>
-            {selectedCustomer && (
-              <Hoverable
-                style={styles.customerClear}
-                hoverOpacity={0.7}
-                onPress={() => { setSelectedCustomer(null); setCustomerQuery(''); }}
-              >
-                <MaterialIcons name="close" size={16} color="#64748B" />
-              </Hoverable>
-            )}
-          </View>
-
-          {selectedCustomer ? (
-            <View style={styles.customerChip}>
-              <MaterialIcons name="check-circle" size={16} color={THEME_ORANGE} />
-              <Text style={styles.customerChipName}>{selectedCustomer.name}</Text>
-              {!!selectedCustomer.phone && <Text style={styles.customerChipMeta}>{selectedCustomer.phone}</Text>}
-            </View>
-          ) : (
-            <>
-              <View style={styles.customerSearchBox}>
-                <MaterialIcons name="search" size={18} color="#94A3B8" />
-                <TextInput
-                  style={styles.customerSearch}
-                  placeholder={customers.length > 0 ? 'Search customer by name or phone…' : 'No customers on this server'}
-                  placeholderTextColor="#94A3B8"
-                  autoCorrect={false}
-                  value={customerQuery}
-                  onChangeText={setCustomerQuery}
-                  editable={customers.length > 0}
-                />
-              </View>
-
-              {customerQuery.trim().length > 0 && (
-                matchedCustomers.length > 0 ? (
-                  <View style={styles.customerList}>
-                    {matchedCustomers.map((c) => (
-                      <TouchableOpacity
-                        key={c.id}
-                        style={styles.customerOption}
-                        activeOpacity={0.7}
-                        onPress={() => {
-                          setSelectedCustomer(c);
-                          setCustomerQuery('');
-                        }}
-                      >
-                        <Text style={styles.customerOptionName} numberOfLines={1}>{c.name}</Text>
-                        <Text style={styles.customerOptionMeta} numberOfLines={1}>
-                          {c.phone || c.email || c.address || `Customer #${c.id}`}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                ) : (
-                  <Text style={styles.customerEmpty}>No matching customer</Text>
-                )
-              )}
-            </>
-          )}
-        </View>
-
-        {/* Order Now Button */}
-        <Hoverable
-          style={[styles.orderNowBtn, (submitting || cartList.length === 0) && styles.disabledBtn]}
-          onPress={handleSubmitOrder}
-          disabled={submitting || cartList.length === 0}
-          hoverOpacity={0.85}
-        >
-          {submitting
-            ? <ActivityIndicator color="#FFFFFF" />
-            : (
-              <Text style={styles.orderNowBtnText}>
-                Order Now {totalCartAmount > 0 ? `• ${currencySymbol} ${totalCartAmount.toLocaleString()}` : ''}
-              </Text>
-            )}
-        </Hoverable>
-      </ScrollView>
+        </ScrollView>
+    <View style={styles.stickyBar}>
+      <View style={styles.stickySummary}>
+        <Text style={styles.summaryText}>
+          {cartList.length} item(s)
+        </Text>
+        <Text style={styles.summaryAmount}>
+          {currencySymbol} {totalCartAmount.toLocaleString()}
+        </Text>
+      </View>
+      <Hoverable
+        style={styles.orderNowBtn}
+        onPress={handleSubmitOrder}
+        disabled={cartList.length === 0}
+        hoverOpacity={0.85}
+      >
+        <Text style={styles.orderNowBtnText}>
+          {cartList.length > 0
+            ? `Order Now • ${currencySymbol} ${totalCartAmount.toLocaleString()}`
+            : 'Order Now'}
+        </Text>
+      </Hoverable>
+    </View>
     </SafeAreaView>
   );
 }
@@ -579,6 +565,9 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   header:       { height: getResponsiveValue({ xs: 52, sm: 54, md: 56, lg: 60, xl: 64 }, bp.breakpoint), backgroundColor: THEME_ORANGE, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: getSpacing(bp.breakpoint, 'md'), elevation: 3 },
   backBtn:      { padding: getSpacing(bp.breakpoint, 'xs') },
   headerTitle:  { color: '#FFFFFF', fontSize: getFontSize(bp.breakpoint, 'lg'), fontWeight: '800' },
+  headerCenter: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'xs'), paddingHorizontal: getSpacing(bp.breakpoint, 'xs') },
+  headerResBadge: { backgroundColor: 'rgba(255,255,255,0.24)', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  headerResBadgeText: { color: '#FFFFFF', fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '900', letterSpacing: 0.4 },
   center:       { flex: 1, justifyContent: 'center', alignItems: 'center', padding: getSpacing(bp.breakpoint, 'lg') },
   loadingText:  { marginTop: getSpacing(bp.breakpoint, 'md'), fontSize: getFontSize(bp.breakpoint, 'md'), color: '#64748B' },
   errorText:    { marginTop: getSpacing(bp.breakpoint, 'md'), fontSize: getFontSize(bp.breakpoint, 'lg'), color: '#EF4444', textAlign: 'center' },
@@ -586,7 +575,7 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   retryBtnText: { color: '#FFF', fontWeight: '700', fontSize: getFontSize(bp.breakpoint, 'md') },
 
   scroll:       { flex: 1 },
-  scrollContent:{ padding: getSpacing(bp.breakpoint, 'md'), paddingBottom: getSpacing(bp.breakpoint, 'xl') },
+  scrollContent:{ padding: getSpacing(bp.breakpoint, 'md'), paddingBottom: getSpacing(bp.breakpoint, 'xl') + 80 },
 
   searchBar:    { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFFFFF', borderRadius: getBorderRadius(bp.breakpoint, 'md'), borderWidth: 1, borderColor: BORDER_COLOR, paddingHorizontal: getSpacing(bp.breakpoint, 'md'), height: getResponsiveValue({ xs: 40, sm: 42, md: 44, lg: 48, xl: 52 }, bp.breakpoint), marginBottom: getSpacing(bp.breakpoint, 'sm'), gap: getSpacing(bp.breakpoint, 'sm') },
   searchInput:  { flex: 1, fontSize: getFontSize(bp.breakpoint, 'md'), color: '#0F172A' },
@@ -694,23 +683,12 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   remarkTable: { backgroundColor: '#FFFFFF', borderRadius: getBorderRadius(bp.breakpoint, 'md'), borderWidth: 1, borderColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md') },
   remarkInput: { backgroundColor: '#F8FAFC', borderRadius: getBorderRadius(bp.breakpoint, 'sm'), borderWidth: 1, borderColor: '#E2E8F0', padding: getSpacing(bp.breakpoint, 'md'), height: moderateScale(110, 0.5, bp.breakpoint), textAlignVertical: 'top', fontSize: getFontSize(bp.breakpoint, 'sm'), color: '#0F172A' },
 
-  customerCard:   { backgroundColor: '#FFFFFF', borderRadius: getBorderRadius(bp.breakpoint, 'md'), borderWidth: 1, borderColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md'), marginBottom: getSpacing(bp.breakpoint, 'md') },
-  customerHeader: { flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'xs'), marginBottom: getSpacing(bp.breakpoint, 'sm') },
-  customerTitle:  { fontSize: getFontSize(bp.breakpoint, 'md'), fontWeight: '800', color: '#0F172A' },
-  customerHint:   { flex: 1, fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#94A3B8' },
-  customerClear:  { width: moderateScale(24, 0.5, bp.breakpoint), height: moderateScale(24, 0.5, bp.breakpoint), borderRadius: moderateScale(12, 0.5, bp.breakpoint), backgroundColor: '#F1F5F9', alignItems: 'center', justifyContent: 'center' },
-  customerChip:   { flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'xs'), backgroundColor: '#FFF3E0', borderWidth: 1, borderColor: THEME_ORANGE, borderRadius: getBorderRadius(bp.breakpoint, 'lg'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm') },
-  customerChipName:{ fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '800', color: '#0F172A', flexShrink: 1 },
-  customerChipMeta:{ fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#64748B' },
-  customerSearchBox:{ flexDirection: 'row', alignItems: 'center', gap: getSpacing(bp.breakpoint, 'sm'), backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#E2E8F0', borderRadius: getBorderRadius(bp.breakpoint, 'md'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), height: moderateScale(44, 0.5, bp.breakpoint) },
-  customerSearch: { flex: 1, fontSize: getFontSize(bp.breakpoint, 'sm'), color: '#0F172A' },
-  customerList:   { marginTop: getSpacing(bp.breakpoint, 'xs'), borderWidth: 1, borderColor: '#E2E8F0', borderRadius: getBorderRadius(bp.breakpoint, 'md'), backgroundColor: '#FFFFFF', overflow: 'hidden' },
-  customerOption: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: getSpacing(bp.breakpoint, 'sm'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm'), borderBottomWidth: 1, borderBottomColor: '#F1F5F9' },
-  customerOptionName:{ fontSize: getFontSize(bp.breakpoint, 'sm'), fontWeight: '700', color: '#0F172A', flexShrink: 1 },
-  customerOptionMeta:{ fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#64748B' },
-  customerEmpty:  { marginTop: getSpacing(bp.breakpoint, 'xs'), fontSize: getFontSize(bp.breakpoint, 'xs'), color: '#94A3B8' },
-
   orderNowBtn:    { backgroundColor: BRAND_ORANGE, borderRadius: getBorderRadius(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'md'), alignItems: 'center', justifyContent: 'center', elevation: 3 },
   orderNowBtnText:{ color: '#FFFFFF', fontSize: getFontSize(bp.breakpoint, 'lg'), fontWeight: '900' },
   disabledBtn:    { opacity: 0.7 },
+
+  stickyBar:      { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#F8FAFC', borderTopWidth: 1, borderTopColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md'), zIndex: 10 },
+  stickySummary:  { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  summaryText:    { fontSize: getFontSize(bp.breakpoint, 'sm'), color: TEXT_MUTED },
+  summaryAmount:  { fontSize: getFontSize(bp.breakpoint, 'sm'), color: BRAND_ORANGE },
 });

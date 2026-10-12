@@ -110,8 +110,10 @@ export function formatThermalReceiptHtml(order: Order, cafeName = 'CafeOS', cafe
 
 export async function executeOrderPrint(orderId: number, orderData?: Order): Promise<boolean> {
   try {
-    // 1. Call API print bill endpoint
+    // 1. Call API print bill endpoint (servers without a print route answer
+    //    404 here — the web receipt below still goes out, so remember it).
     const apiRes = await orderApi.printBill(orderId);
+    let webPrinted = false;
 
     // 2. If running in a web browser, trigger web printing pop-up window
     if (Platform.OS === 'web') {
@@ -129,11 +131,12 @@ export async function executeOrderPrint(orderId: number, orderData?: Order): Pro
         if (printWindow) {
           printWindow.document.write(printHtml);
           printWindow.document.close();
+          webPrinted = true;
         }
       }
     }
 
-    return apiRes.success;
+    return apiRes.success || webPrinted;
   } catch (err) {
     console.error('Print execution error:', err);
     return false;

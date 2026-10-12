@@ -15,6 +15,12 @@ import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@
 /** AsyncStorage/localStorage key holding the user-selected server URL. */
 export const BASE_URL_STORAGE_KEY = 'smart_cafe_base_url';
 
+/** Key holding the last menu snapshot the app rendered (see api.ts). */
+export const MENU_CACHE_STORAGE_KEY = 'smart_cafe_cached_menu';
+
+/** Key holding the last floor-plan snapshot the app rendered (see api.ts). */
+export const TABLES_CACHE_STORAGE_KEY = 'smart_cafe_cached_tables';
+
 /** Production CafeOS server — the default when no saved/env URL exists. */
 export const CAFEOS_PRODUCTION_URL = 'https://cafeos.leadingedge.com.np';
 
@@ -250,8 +256,6 @@ export function resetBaseUrl(): string {
 function readSavedBaseUrl(): string {
   const saved = getStorageItemSync(BASE_URL_STORAGE_KEY);
   if (!saved || !saved.trim()) return DEFAULT_BASE_URL;
-  // A stored value from an older build may no longer be valid — ignore it
-  // rather than booting the app into a broken URL.
   const check = validateBaseUrl(saved);
   return check.ok ? check.url : DEFAULT_BASE_URL;
 }

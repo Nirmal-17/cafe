@@ -16,13 +16,22 @@ import {
 } from '@expo/vector-icons';
 
 import { Hoverable } from '@/components/Hoverable';
-import { showBottomToast } from '@/components/BottomToast';
 import {
   Table,
   Section,
   Order,
   StaffUser,
+  isReservedTable as isTableReserved,
 } from '@/services/api';
+import {
+  useReservationsRevision,
+} from '@/utils/reservations';
+import {
+  filterTablesByServiceTypeWithFallback,
+  getServiceTypeLabel,
+  ServiceType,
+} from '@/utils/diningArea';
+import { groupTablesBySection } from '@/utils/tableSections';
 
 import {
   useResponsive,
@@ -31,7 +40,6 @@ import {
   getFontSize,
   getBorderRadius,
   getGridGap,
-  getCardPadding,
   getIconSize,
   moderateScale,
   getResponsiveValue,
@@ -42,13 +50,21 @@ import {
 // ============================================================
 
 const BRAND_PRIMARY = '#073F78';
+const BRAND_NAVY = '#0A3D66';
 const BRAND_ORANGE = '#FF6D00';
 const BRAND_YELLOW = '#FFD600';
 const BRAND_WHITE = '#FFFFFF';
 
 const COLOR_ERROR = '#D32F2F';
-const COLOR_MUTED = '#6B7280';
-const COLOR_BOOKED = '#7C3AED';
+
+const DOT_FREE = '#16A34A';
+const DOT_RESERVED = '#4C1D95';
+const DOT_OFFLINE = '#9CA3AF';
+
+const RESERVED_BG = '#4C1D95';
+const RESERVED_BORDER = '#4C1D95';
+const FREE_BG = '#FFFFFF';
+const FREE_BORDER = '#E5E7EB';
 
 const BG_LIGHT = '#F0F4FF';
 const BG_SURFACE = '#FFFFFF';
@@ -57,6 +73,12 @@ const BORDER_COLOR = '#CBD5E1';
 
 const TEXT_DARK = '#000000';
 const TEXT_MUTED = '#6B7280';
+
+// Service filter blocks: golden-orange fill when active/hovered,
+// white block with dark-teal text when idle.
+const SERVICE_ACTIVE_FILL = '#C07F00';
+const SERVICE_INACTIVE_TEXT = '#0E5A6B';
+const SERVICE_INACTIVE_BORDER = '#D9E4E7';
 
 // ============================================================
 // TYPES
@@ -121,7 +143,6 @@ export function MyTableScreen({
   homeLoading,
 
   onTablePress,
-  onChangeTableStatus,
   onOrderDetailsPress,
 
   onShowDrawer,
@@ -148,40 +169,18 @@ export function MyTableScreen({
   // BOOKING (direct reserve — no customer details form)
   // ----------------------------------------------------------
 
-  // Per-table busy id: only the pressed button locks, and the parent applies
-  // the status change optimistically so the card repaints on the next frame.
-  const [bookingTableId, setBookingTableId] = useState<number | null>(null);
-  // Status a table had before being booked (CLEANING tables restored on cancel)
-  const preBookStatusRef = useRef<Map<number, string>>(new Map());
+  // Re-render the grid when a RES-#### code is minted or dropped.
+  useReservationsRevision();
 
-  const handleBookTable = useCallback(async (table: Table) => {
-    if (bookingTableId != null) return;
-    setBookingTableId(table.id);
-    try {
-      const ok = await onChangeTableStatus(table.id, 'RESERVED');
-      if (ok) {
-        preBookStatusRef.current.set(table.id, String(table.status).toUpperCase());
-        showBottomToast({ title: `Table ${table.tableNumber} reserved`, tone: 'success' });
-      }
-    } finally {
-      setBookingTableId(null);
-    }
-  }, [bookingTableId, onChangeTableStatus]);
+  // ----------------------------------------------------------
+  // FILTERS (match the floor-plan mockup)
+  // Top row: Dine In / Delivery / Takeaway (service type).
+  // Inside the Tables card: All / Free / Reserved (availability).
+  // ----------------------------------------------------------
 
-  const handleCancelBooking = useCallback(async (table: Table) => {
-    if (bookingTableId != null) return;
-    setBookingTableId(table.id);
-    try {
-      const restoreStatus = preBookStatusRef.current.get(table.id) ?? 'AVAILABLE';
-      const ok = await onChangeTableStatus(table.id, restoreStatus);
-      if (ok) {
-        preBookStatusRef.current.delete(table.id);
-        showBottomToast({ title: `Booking cancelled for table ${table.tableNumber}`, tone: 'info' });
-      }
-    } finally {
-      setBookingTableId(null);
-    }
-  }, [bookingTableId, onChangeTableStatus]);
+  const [serviceFilter, setServiceFilter] = useState<ServiceType>('dine-in');
+  const [availabilityFilter, setAvailabilityFilter] = useState<'all' | 'free' | 'reserved'>('all');
+  const [hoveredServiceTab, setHoveredServiceTab] = useState<string | null>(null);
 
   const handleScroll = useCallback((event: any) => {
     const y = event.nativeEvent.contentOffset.y;
@@ -201,14 +200,17 @@ export function MyTableScreen({
   // USER ROLE
   // ----------------------------------------------------------
 
-  const isWaiter = user?.role === 'WAITER';
+  // Parity: waiter and admin see the same table list — no role-based
+  // filtering or labelling. `user` stays in props for API compat.
+  void user;
 
   // ----------------------------------------------------------
   // FILTERED TABLES
   // ----------------------------------------------------------
 
-  // Search + waiter visibility (section filter NOT applied yet) — shared by the
-  // grid and the section counts so a chip's number always matches its cards.
+  // Search visibility (service/section/availability filters NOT applied
+  // yet) — shared by the grid and the chips so a chip's number always
+  // matches its cards.
   const visibleTables = useMemo(() => {
     const search = tableSearchQuery.trim().toLowerCase();
 
@@ -225,116 +227,87 @@ export function MyTableScreen({
         return false;
       }
 
-      // Waiter filter
-      if (isWaiter) {
-        const status = String(table.status).toUpperCase();
-
-        const isAvailable =
-          status === 'AVAILABLE' ||
-          status === 'RESERVED';
-
-        const waiterId = table.activeSession?.waiterId;
-
-        const isMyTable =
-          waiterId !== null &&
-          waiterId !== undefined &&
-          String(waiterId) === String(user?.id);
-
-        // Busy tables nobody is serving (e.g. stuck in PENDING_BILL with no
-        // open session) must stay visible — someone has to clear them.
-        const isUnassigned = !table.activeSession;
-
-        return isAvailable || isMyTable || isUnassigned;
-      }
-
       return true;
     });
-  }, [tables, tableSearchQuery, isWaiter, user?.id]);
+  }, [tables, tableSearchQuery]);
+
+  const isReservedTable = useCallback((table: Table) => isTableReserved(table), []);
+
+  const isFreeTable = useCallback((table: Table) => !isTableReserved(table), []);
+
+  // Service-type slice (top Dine In / Delivery / Takeaway row).
+  // Backend section filter still applies underneath for compatibility.
+  const serviceTables = useMemo(() => {
+    const byService = filterTablesByServiceTypeWithFallback(visibleTables, serviceFilter);
+    if (activeSectionId === null) return byService;
+    return byService.filter(
+      (table) => String(table.sectionId) === String(activeSectionId)
+    );
+  }, [visibleTables, serviceFilter, activeSectionId]);
+
+  const allCount = serviceTables.length;
+  const freeCount = useMemo(
+    () => serviceTables.filter(isFreeTable).length,
+    [serviceTables, isFreeTable]
+  );
+  const reservedCount = useMemo(
+    () => serviceTables.filter(isReservedTable).length,
+    [serviceTables, isReservedTable]
+  );
+
+  const handleSeeAllTables = useCallback(() => {
+    setServiceFilter('dine-in');
+    setAvailabilityFilter('all');
+    setActiveSectionId(null);
+    setTableSearchQuery('');
+  }, [setActiveSectionId, setTableSearchQuery]);
 
   const filteredTables = useMemo(() => {
-    const result = visibleTables
+    const result = serviceTables
       .filter((table) => {
-        // Section filter
-        if (
-          activeSectionId !== null &&
-          String(table.sectionId) !== String(activeSectionId)
-        ) {
+        // Availability filter (All / Free / Reserved chips in the Tables card)
+        if (availabilityFilter === 'free' && !isFreeTable(table)) {
+          return false;
+        }
+        if (availabilityFilter === 'reserved' && !isReservedTable(table)) {
           return false;
         }
 
         return true;
       })
       .sort((a, b) => {
-        const getPriority = (table: Table) => {
-          const status = String(table.status).toUpperCase();
+        // Reserve-only: reserved tables first, then free.
+        const getPriority = (table: Table) => (isTableReserved(table) ? 1 : 2);
 
-          if (
-            status === 'UNAVAILABLE' ||
-            status === 'PACKED' ||
-            status === 'OUT_OF_SERVICE'
-          ) {
-            return 4;
-          }
+        const priorityDiff = getPriority(a) - getPriority(b);
+        if (priorityDiff !== 0) return priorityDiff;
 
-          if (
-            status === 'RESERVED' ||
-            table.is_reserved === true
-          ) {
-            return 3;
-          }
-
-          if (
-            status === 'OCCUPIED' ||
-            status === 'PENDING_BILL'
-          ) {
-            return 2;
-          }
-
-          return 1;
-        };
-
-        return getPriority(a) - getPriority(b);
+        // Natural sort so "D2" comes before "D10", matching the floor plan.
+        return String(a.tableNumber).localeCompare(
+          String(b.tableNumber),
+          undefined,
+          { numeric: true, sensitivity: 'base' }
+        );
       });
 
     return result;
-  }, [visibleTables, activeSectionId]);
+  }, [serviceTables, availabilityFilter, isFreeTable, isReservedTable]);
 
-  // ----------------------------------------------------------
-  // ORDER LOOKUP
-  // ----------------------------------------------------------
-
-  const ordersByTable = useMemo(() => {
-    const map = new Map<
-      number,
-      {
-        count: number;
-        hasUnpaidBill: boolean;
+  // Dine In groups by dining area so every floor section gets its own
+  // heading — Indoor / Outdoor / Roof / Cabin / Hall / Garden / Pool / Room
+  // (resolved via sections list + table-name inference, see tableSections).
+  // Delivery / Takeaway keep a single group under their own heading, since
+  // their tables (Del*, T*) share one service meaning, not an area.
+  const groupedTables = useMemo<[string, Table[]][]>(
+    () => {
+      if (filteredTables.length === 0) return [];
+      if (serviceFilter === 'dine-in') {
+        return groupTablesBySection(filteredTables, sections);
       }
-    >();
-
-    activeOrders.forEach((order) => {
-      const tableId = order.tableId;
-
-      if (tableId === null || tableId === undefined) {
-        return;
-      }
-
-      const current = map.get(tableId) ?? {
-        count: 0,
-        hasUnpaidBill: false,
-      };
-
-      current.count += 1;
-
-      if (order.paymentStatus === 'UNPAID') {
-        current.hasUnpaidBill = true;
-      }
-
-      map.set(tableId, current);
-    });
-
-    return map;
-  }, [activeOrders]);
+      return [[getServiceTypeLabel(serviceFilter), filteredTables]];
+    },
+    [filteredTables, serviceFilter, sections],
+  );
 
   // ----------------------------------------------------------
   // DYNAMIC STYLES
@@ -347,16 +320,17 @@ export function MyTableScreen({
   );
 
   // ----------------------------------------------------------
-  // SECTION COUNTS
+  // SERVICE TABS (top row of the mockup)
   // ----------------------------------------------------------
 
-  const getSectionCount = useCallback(
-    (sectionId: number) => {
-      return visibleTables.filter(
-        (table) => String(table.sectionId) === String(sectionId)
-      ).length;
-    },
-    [visibleTables]
+  const serviceTabs = useMemo(
+    () =>
+      [
+        { key: 'dine-in', label: 'Dine In', icon: 'silverware-fork-knife' },
+        { key: 'delivery', label: 'Delivery', icon: 'scooter' },
+        { key: 'takeaway', label: 'Takeaway', icon: 'food-takeout-box' },
+      ] as const,
+    []
   );
 
   // ==========================================================
@@ -483,7 +457,7 @@ export function MyTableScreen({
 
         <View style={styles.sectionTitleRow}>
           <Text style={styles.sectionTitle}>
-            {isWaiter ? 'My Tables' : 'All Tables'}
+            All Tables
           </Text>
 
           <Text style={styles.sectionCount}>
@@ -538,7 +512,7 @@ export function MyTableScreen({
         </View>
 
         {/* ==================================================
-            SECTION FILTERS
+            SERVICE FILTERS (Dine In / Delivery / Takeaway)
         ================================================== */}
 
         <ScrollView
@@ -547,52 +521,41 @@ export function MyTableScreen({
           style={styles.filterScroll}
           contentContainerStyle={styles.chipsRow}
         >
-          {/* All */}
-          <Hoverable
-            style={[
-              styles.chip,
-              activeSectionId === null &&
-                styles.chipActive,
-            ]}
-            onPress={() => setActiveSectionId(null)}
-            hoverOpacity={0.8}
-          >
-            <Text
-              style={[
-                styles.chipText,
-                activeSectionId === null &&
-                  styles.chipTextActive,
-              ]}
-            >
-              All ({visibleTables.length})
-            </Text>
-          </Hoverable>
-
-          {/* Sections */}
-          {sections.map((section) => {
-            const isActive =
-              section.id === activeSectionId;
+          {serviceTabs.map((tab) => {
+            const isActive = serviceFilter === tab.key;
+            const isHovered = hoveredServiceTab === tab.key;
+            const highlighted = isActive || isHovered;
 
             return (
               <Hoverable
-                key={section.id}
+                key={tab.key}
                 style={[
-                  styles.chip,
-                  isActive && styles.chipActive,
+                  styles.serviceChip,
+                  highlighted && styles.serviceChipActive,
                 ]}
-                onPress={() =>
-                  setActiveSectionId(section.id)
+                hoverStyle={styles.serviceChipActive}
+                onPress={() => setServiceFilter(tab.key)}
+                onHoverIn={() => setHoveredServiceTab(tab.key)}
+                onHoverOut={() =>
+                  setHoveredServiceTab((cur) => (cur === tab.key ? null : cur))
                 }
-                hoverOpacity={0.8}
+                hoverOpacity={1}
+                accessibilityRole="button"
+                accessibilityLabel={`Show ${tab.label} tables`}
               >
+                <MaterialCommunityIcons
+                  name={tab.icon as any}
+                  size={18}
+                  color={highlighted ? BRAND_WHITE : SERVICE_INACTIVE_TEXT}
+                />
                 <Text
                   style={[
-                    styles.chipText,
-                    isActive && styles.chipTextActive,
+                    styles.serviceChipText,
+                    highlighted && styles.serviceChipTextActive,
                   ]}
                   numberOfLines={1}
                 >
-                  {section.name} ({getSectionCount(section.id)})
+                  {tab.label}
                 </Text>
               </Hoverable>
             );
@@ -600,36 +563,123 @@ export function MyTableScreen({
         </ScrollView>
 
         {/* ==================================================
-            TABLE GRID
+            TABLES CARD (Tables + All/Free/Reserved + grid)
         ================================================== */}
 
-        <View style={styles.tablesGrid}>
-          {filteredTables.map((table) => {
-            const status = String(
-              table.status
-            ).toUpperCase();
+        <View style={styles.tablesCard}>
+          {/* Card header */}
+          <View style={styles.tablesCardHeader}>
+            <View style={styles.tablesCardTitleRow}>
+              <View style={styles.tablesCardIconBox}>
+                <MaterialCommunityIcons
+                  name="table-furniture"
+                  size={20}
+                  color={BRAND_ORANGE}
+                />
+              </View>
 
-            const isReserved =
-              status === 'RESERVED' ||
-              table.is_reserved === true;
+              <Text style={styles.tablesCardTitle}>
+                Tables
+              </Text>
+            </View>
 
-            const isOccupied =
-              status === 'OCCUPIED' ||
-              status === 'PENDING_BILL';
+            <View style={styles.tablesCardHeaderRight}>
+              <View style={styles.tablesCountPill}>
+                <Text style={styles.tablesCountPillText}>
+                  {allCount}
+                </Text>
+              </View>
 
-            const orderInfo =
-              ordersByTable.get(table.id);
+              <Hoverable
+                onPress={handleSeeAllTables}
+                hoverOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel="Show all tables"
+              >
+                <Text style={styles.seeAllText}>
+                  See all
+                </Text>
+              </Hoverable>
+            </View>
+          </View>
 
-            const orderCount =
-              orderInfo?.count ?? 0;
+          {/* Availability chips */}
+          <View style={styles.statusChipsRow}>
+            <Hoverable
+              style={[
+                styles.statusChip,
+                availabilityFilter === 'all' && styles.statusChipActive,
+              ]}
+              onPress={() => setAvailabilityFilter('all')}
+              hoverOpacity={0.8}
+              accessibilityRole="button"
+              accessibilityLabel={`Show all ${allCount} tables`}
+            >
+              <Text
+                style={[
+                  styles.statusChipText,
+                  availabilityFilter === 'all' && styles.statusChipTextActive,
+                ]}
+              >
+                All ({allCount})
+              </Text>
+            </Hoverable>
 
-            const hasUnpaidBill =
-              orderInfo?.hasUnpaidBill ?? false;
+            <Hoverable
+              style={[
+                styles.statusChip,
+                availabilityFilter === 'free' && styles.statusChipActive,
+              ]}
+              onPress={() => setAvailabilityFilter('free')}
+              hoverOpacity={0.8}
+              accessibilityRole="button"
+              accessibilityLabel={`Show ${freeCount} free tables`}
+            >
+              <Text
+                style={[
+                  styles.statusChipText,
+                  availabilityFilter === 'free' && styles.statusChipTextActive,
+                ]}
+              >
+                Free ({freeCount})
+              </Text>
+            </Hoverable>
 
-            const canToggleBooked =
-              status === 'AVAILABLE' ||
-              status === 'RESERVED' ||
-              status === 'CLEANING';
+            <Hoverable
+              style={[
+                styles.statusChip,
+                availabilityFilter === 'reserved' && styles.statusChipActive,
+              ]}
+              onPress={() => setAvailabilityFilter('reserved')}
+              hoverOpacity={0.8}
+              accessibilityRole="button"
+              accessibilityLabel={`Show ${reservedCount} reserved tables`}
+            >
+              <Text
+                style={[
+                  styles.statusChipText,
+                  availabilityFilter === 'reserved' && styles.statusChipTextActive,
+                ]}
+              >
+                Reserved ({reservedCount})
+              </Text>
+            </Hoverable>
+          </View>
+
+          {/* Table grid — grouped by section (Indoor / Roof / Cabin / Hall …) */}
+          {groupedTables.map(([sectionName, sectionTables]) => (
+          <View key={sectionName} style={styles.sectionGroup}>
+          <Text style={styles.sectionHeading}>{sectionName}</Text>
+          <View style={styles.tablesGrid}>
+          {sectionTables.map((table) => {
+            const isReserved = isTableReserved(table);
+
+            const statusLabel = isReserved ? 'Reserved' : 'Free';
+
+            // Reserve-only: reserved = solid purple + white text, free = white.
+            const cardBackground = isReserved ? RESERVED_BG : FREE_BG;
+            const cardBorder = isReserved ? RESERVED_BG : FREE_BORDER;
+            const cardTextColor = isReserved ? '#FFFFFF' : TEXT_DARK;
 
             return (
               <View
@@ -643,249 +693,54 @@ export function MyTableScreen({
                 <TouchableOpacity
                   style={[
                     styles.tableCard,
-                    isReserved || isOccupied
-                      ? styles.tableCardReserved
-                      : styles.tableCardAvailable,
+                    { backgroundColor: cardBackground, borderColor: cardBorder },
                   ]}
                   activeOpacity={0.85}
                   onPress={() =>
                     onTablePress(table)
                   }
                   accessibilityRole="button"
-                  accessibilityLabel={`Table ${table.tableNumber}`}
+                  accessibilityLabel={`Table ${table.tableNumber}, ${statusLabel}`}
                 >
-                  {/* Top row */}
-                  <View
-                    style={styles.tableCardTopRow}
-                  >
-                    {/* Order badge */}
-                    {orderCount > 0 ? (
-                      <View
-                        style={styles.orderCountBadge}
-                      >
-                        <Text
-                          style={
-                            styles.orderCountBadgeText
-                          }
-                        >
-                          {orderCount}
-                        </Text>
-                      </View>
-                    ) : (
-                      <View />
-                    )}
-
-                    {/* Right actions */}
-                    <View
-                      style={styles.tableCardActions}
-                    >
-                      {/* Unpaid bill */}
-                      {hasUnpaidBill && (
-                        <View
-                          style={
-                            styles.unpaidBillIndicator
-                          }
-                        >
-                          <MaterialCommunityIcons
-                            name="receipt-text-outline"
-                            size={10}
-                            color="#D97706"
-                          />
-
-                          <Text
-                            style={
-                              styles.unpaidBillText
-                            }
-                          >
-                            Bill
-                          </Text>
-                        </View>
-                      )}
-                    </View>
-                  </View>
-
-                  {/* Table number */}
                   <Text
-                    style={[
-                      styles.tableCardText,
-                      isReserved || isOccupied
-                        ? styles.tableCardTextBooked
-                        : null,
-                    ]}
+                    style={[styles.tableCardText, { color: cardTextColor }]}
                     numberOfLines={1}
                   >
                     {table.tableNumber}
                   </Text>
-
-                  {/* Meta information */}
-                  <View
-                    style={styles.tableCardMeta}
-                  >
-                    {isOccupied ? (
-                      <>
-                        <MaterialCommunityIcons
-                          name="clock-outline"
-                          size={11}
-                          color={BRAND_WHITE}
-                        />
-
-                        <Text
-                          style={[
-                            styles.tableCardMetaText,
-                            styles.lightMetaText,
-                          ]}
-                        >
-                          {getElapsedDiningTime(
-                            table.id
-                          )}
-                        </Text>
-                      </>
-                    ) : isReserved ? (
-                      <View
-                        style={
-                          styles.reservedMeta
-                        }
-                      >
-                        <MaterialCommunityIcons
-                          name="bookmark"
-                          size={11}
-                          color={BRAND_WHITE}
-                        />
-
-                        <Text
-                          style={
-                            styles.reservedMetaText
-                          }
-                        >
-                          Booked · {table.capacity}{' '}
-                          seats
-                        </Text>
-                      </View>
-                    ) : status === 'CLEANING' ? (
-                      <View
-                        style={
-                          styles.reservedMeta
-                        }
-                      >
-                        <MaterialCommunityIcons
-                          name="broom"
-                          size={11}
-                          color={COLOR_MUTED}
-                        />
-
-                        <Text
-                          style={
-                            styles.tableCardMetaText
-                          }
-                        >
-                          Cleaning · {table.capacity}{' '}
-                          seats
-                        </Text>
-                      </View>
-                    ) : (
-                      <View
-                        style={
-                          styles.reservedMeta
-                        }
-                      >
-                        <MaterialCommunityIcons
-                          name="account-multiple-outline"
-                          size={11}
-                          color={COLOR_MUTED}
-                        />
-
-                        <Text
-                          style={
-                            styles.tableCardMetaText
-                          }
-                        >
-                          {table.capacity} seats
-                        </Text>
-                      </View>
-                    )}
-                  </View>
                 </TouchableOpacity>
-
-                {/* ==================================================
-                    BOOK / CANCEL BUTTON
-
-                    Kept outside TouchableOpacity to prevent
-                    nested press handling.
-                ================================================== */}
-
-                {canToggleBooked && (
-                  <Hoverable
-                    style={[
-                      styles.bookedToggle,
-                      isReserved && styles.bookedToggleActive,
-                    ]}
-                    onPress={() =>
-                      isReserved
-                        ? handleCancelBooking(table)
-                        : handleBookTable(table)
-                    }
-                    disabled={bookingTableId !== null}
-                    hoverOpacity={0.75}
-                    accessibilityRole="button"
-                    accessibilityLabel={
-                      isReserved
-                        ? `Cancel booking for table ${table.tableNumber}`
-                        : `Book table ${table.tableNumber}`
-                    }
-                  >
-                    <MaterialCommunityIcons
-                      name={
-                        isReserved ? 'bookmark-remove-outline' : 'bookmark-plus-outline'
-                      }
-                      size={11}
-                      color={
-                        isReserved ? COLOR_ERROR : COLOR_BOOKED
-                      }
-                    />
-
-                    <Text
-                      style={[
-                        styles.bookedToggleText,
-                        isReserved && styles.bookedToggleTextActive,
-                      ]}
-                    >
-                      {isReserved ? 'Cancel' : 'Book'}
-                    </Text>
-                  </Hoverable>
-                )}
               </View>
             );
           })}
-        </View>
+          </View>
+          </View>
+          ))}
 
-        {/* ==================================================
-            EMPTY STATE
-        ================================================== */}
-
-        {filteredTables.length === 0 &&
-          !homeLoading && (
+          {filteredTables.length === 0 && !homeLoading && (
             <View style={styles.emptyState}>
               <MaterialCommunityIcons
                 name="table-furniture"
-                size={48}
+                size={40}
                 color={TEXT_MUTED}
               />
 
               <Text style={styles.emptyStateText}>
                 {tableSearchQuery.trim()
                   ? 'No tables match your search'
-                  : 'No tables found in this section'}
+                  : availabilityFilter === 'free'
+                    ? 'No free tables right now'
+                    : availabilityFilter === 'reserved'
+                      ? 'No reserved tables'
+                      : 'No tables found'}
               </Text>
             </View>
           )}
 
-        {/* Loading state */}
-        {homeLoading &&
-          filteredTables.length === 0 && (
+          {homeLoading && filteredTables.length === 0 && (
             <View style={styles.emptyState}>
               <MaterialCommunityIcons
                 name="loading"
-                size={32}
+                size={28}
                 color={BRAND_ORANGE}
               />
 
@@ -894,6 +749,7 @@ export function MyTableScreen({
               </Text>
             </View>
           )}
+        </View>
       </ScrollView>
 
       {/* ======================================================
@@ -1272,14 +1128,239 @@ function createStyles(breakpoint: any) {
       ),
     },
 
-    chip: {
+    // --------------------------------------------------------
+    // SERVICE FILTERS (top Dine In / Delivery / Takeaway)
+    // --------------------------------------------------------
+
+    serviceChip: {
+      height: 48,
+
+      paddingHorizontal: getSpacing(
+        breakpoint,
+        'lg'
+      ),
+
+      borderRadius: 8,
+
+      backgroundColor: BG_SURFACE,
+
+      borderWidth: 1,
+      borderColor: SERVICE_INACTIVE_BORDER,
+
+      flexDirection: 'row',
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 8,
+
+      ...(Platform.OS === 'web'
+        ? {
+            cursor: 'pointer',
+            transition: 'border-color 0.15s ease, background-color 0.15s ease' as any,
+          }
+        : {}),
+    },
+
+    serviceChipActive: {
+      backgroundColor: SERVICE_ACTIVE_FILL,
+      borderColor: SERVICE_ACTIVE_FILL,
+    },
+
+    serviceChipHovered: {
+      backgroundColor: SERVICE_ACTIVE_FILL,
+      borderColor: SERVICE_ACTIVE_FILL,
+    },
+
+    serviceChipText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'md'
+      ),
+
+      fontWeight: '800',
+
+      color: SERVICE_INACTIVE_TEXT,
+    },
+
+    serviceChipTextActive: {
+      color: BRAND_WHITE,
+      fontWeight: '800',
+    },
+
+    serviceChipTextHovered: {
+      color: BRAND_WHITE,
+      fontWeight: '800',
+    },
+
+    // --------------------------------------------------------
+    // TABLES CARD
+    // --------------------------------------------------------
+
+    tablesCard: {
+      backgroundColor: BG_SURFACE,
+
+      borderRadius: getBorderRadius(
+        breakpoint,
+        'lg'
+      ),
+
+      borderWidth: 1,
+      borderColor: '#E5E7EB',
+
+      padding: getSpacing(
+        breakpoint,
+        'md'
+      ),
+
+      shadowColor: '#0F172A',
+      shadowRadius: moderateScale(
+        6,
+        0.5,
+        breakpoint
+      ),
+
+      shadowOffset: {
+        width: 0,
+        height: moderateScale(
+          2,
+          0.5,
+          breakpoint
+        ),
+      },
+
+      shadowOpacity: 0.06,
+
+      elevation: 2,
+    },
+
+    tablesCardHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+
+      marginBottom: getSpacing(
+        breakpoint,
+        'md'
+      ),
+    },
+
+    tablesCardTitleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+
+      gap: getSpacing(
+        breakpoint,
+        'sm'
+      ),
+    },
+
+    tablesCardIconBox: {
+      width: moderateScale(36, 0.5, breakpoint),
+      height: moderateScale(36, 0.5, breakpoint),
+      borderRadius: moderateScale(10, 0.5, breakpoint),
+      backgroundColor: '#FFF3E8',
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+
+    tablesCardTitle: {
+      fontSize: getFontSize(
+        breakpoint,
+        'xl'
+      ),
+
+      fontWeight: '800',
+
+      color: TEXT_DARK,
+    },
+
+    tablesCardHeaderRight: {
+      flexDirection: 'row',
+      alignItems: 'center',
+
+      gap: getSpacing(
+        breakpoint,
+        'sm'
+      ),
+    },
+
+    tablesCountPill: {
+      backgroundColor: BRAND_NAVY,
+
+      borderRadius: moderateScale(
+        12,
+        0.5,
+        breakpoint
+      ),
+
+      minWidth: moderateScale(
+        36,
+        0.5,
+        breakpoint
+      ),
+
+      paddingHorizontal: moderateScale(
+        10,
+        0.5,
+        breakpoint
+      ),
+
+      paddingVertical: moderateScale(
+        4,
+        0.5,
+        breakpoint
+      ),
+
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+
+    tablesCountPillText: {
+      color: BRAND_WHITE,
+
+      fontSize: getFontSize(
+        breakpoint,
+        'sm'
+      ),
+
+      fontWeight: '800',
+    },
+
+    seeAllText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'md'
+      ),
+
+      fontWeight: '700',
+
+      color: BRAND_ORANGE,
+    },
+
+    statusChipsRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+
+      gap: getSpacing(
+        breakpoint,
+        'sm'
+      ),
+
+      alignItems: 'center',
+
+      marginBottom: getSpacing(
+        breakpoint,
+        'md'
+      ),
+    },
+
+    statusChip: {
       height: getResponsiveValue(
         {
-          xs: 34,
-          sm: 36,
-          md: 38,
-          lg: 40,
-          xl: 42,
+          xs: 32,
+          sm: 34,
+          md: 36,
+          lg: 36,
+          xl: 38,
         },
         breakpoint
       ),
@@ -1291,19 +1372,19 @@ function createStyles(breakpoint: any) {
 
       borderRadius: getResponsiveValue(
         {
-          xs: 17,
-          sm: 18,
-          md: 19,
-          lg: 20,
-          xl: 21,
+          xs: 16,
+          sm: 17,
+          md: 18,
+          lg: 18,
+          xl: 19,
         },
         breakpoint
       ),
 
-      backgroundColor: BG_SURFACE,
+      backgroundColor: '#F1F5F9',
 
       borderWidth: 1,
-      borderColor: BORDER_COLOR,
+      borderColor: '#E2E8F0',
 
       justifyContent: 'center',
       alignItems: 'center',
@@ -1316,12 +1397,12 @@ function createStyles(breakpoint: any) {
         : {}),
     },
 
-    chipActive: {
-      backgroundColor: BRAND_ORANGE,
-      borderColor: BRAND_ORANGE,
+    statusChipActive: {
+      backgroundColor: BRAND_NAVY,
+      borderColor: BRAND_NAVY,
     },
 
-    chipText: {
+    statusChipText: {
       fontSize: getFontSize(
         breakpoint,
         'sm'
@@ -1332,7 +1413,7 @@ function createStyles(breakpoint: any) {
       color: TEXT_MUTED,
     },
 
-    chipTextActive: {
+    statusChipTextActive: {
       color: BRAND_WHITE,
       fontWeight: '800',
     },
@@ -1352,14 +1433,37 @@ function createStyles(breakpoint: any) {
       justifyContent: 'flex-start',
     },
 
+    sectionGroup: {
+      marginBottom: getSpacing(
+        breakpoint,
+        'md'
+      ),
+    },
+
+    sectionHeading: {
+      fontSize: getFontSize(
+        breakpoint,
+        'xl'
+      ),
+
+      fontWeight: '800',
+
+      color: '#0E5A6B',
+
+      marginBottom: getSpacing(
+        breakpoint,
+        'sm'
+      ),
+    },
+
     tableWrapper: {
       width: getResponsiveValue(
         {
           xs: '48%',
-          sm: '48%',
-          md: '31%',
-          lg: '23.5%',
-          xl: '19%',
+          sm: '31.5%',
+          md: '23.5%',
+          lg: '18.8%',
+          xl: '15.5%',
         },
         breakpoint
       ),
@@ -1375,38 +1479,33 @@ function createStyles(breakpoint: any) {
     tableCard: {
       width: '100%',
 
-      minHeight: getResponsiveValue(
-        {
-          xs: 80,
-          sm: 84,
-          md: 86,
-          lg: 90,
-          xl: 94,
-        },
-        breakpoint
-      ),
+      minHeight: 54,
 
       borderRadius: getBorderRadius(
         breakpoint,
-        'lg'
+        'md'
       ),
 
-      justifyContent: 'space-between',
+      justifyContent: 'center',
       alignItems: 'center',
 
-      borderWidth: 1.5,
+      borderWidth: 1,
+      borderColor: '#E5E7EB',
 
-      padding: getCardPadding(
-        breakpoint
+      paddingHorizontal: getSpacing(
+        breakpoint,
+        'md'
       ),
+
+      paddingVertical: moderateScale(12, 0.5, breakpoint),
+
+      gap: moderateScale(2, 0.5, breakpoint),
 
       backgroundColor: BG_SURFACE,
 
-      borderColor: BORDER_COLOR,
-
-      shadowColor: BRAND_ORANGE,
+      shadowColor: '#0F172A',
       shadowRadius: moderateScale(
-        5,
+        4,
         0.5,
         breakpoint
       ),
@@ -1414,15 +1513,15 @@ function createStyles(breakpoint: any) {
       shadowOffset: {
         width: 0,
         height: moderateScale(
-          2,
+          1,
           0.5,
           breakpoint
         ),
       },
 
-      shadowOpacity: 0.15,
+      shadowOpacity: 0.06,
 
-      elevation: 2,
+      elevation: 1,
 
       overflow: 'visible',
 
@@ -1434,141 +1533,24 @@ function createStyles(breakpoint: any) {
         : {}),
     },
 
-    tableCardAvailable: {
-      backgroundColor: '#FFFFFF',
-      borderColor: BORDER_COLOR,
-    },
-
-    tableCardReserved: {
-      backgroundColor: COLOR_BOOKED,
-      borderColor: COLOR_BOOKED,
-    },
-
     // --------------------------------------------------------
-    // TABLE TOP ROW
+    // MINI TABLE CARD
     // --------------------------------------------------------
 
     tableCardTopRow: {
       flexDirection: 'row',
 
-      justifyContent:
-        'space-between',
+      justifyContent: 'space-between',
 
       alignItems: 'center',
 
       width: '100%',
-
-      minHeight: moderateScale(
-        12,
-        0.5,
-        breakpoint
-      ),
     },
 
-    tableCardActions: {
-      flexDirection: 'row',
-
-      alignItems: 'center',
-
-      gap: moderateScale(
-        4,
-        0.5,
-        breakpoint
-      ),
-    },
-
-    // --------------------------------------------------------
-    // ORDER BADGE
-    // --------------------------------------------------------
-
-    orderCountBadge: {
-      position: 'absolute',
-
-      top: -moderateScale(
-        8,
-        0.5,
-        breakpoint
-      ),
-
-      left: -moderateScale(
-        8,
-        0.5,
-        breakpoint
-      ),
-
-      minWidth: moderateScale(
-        24,
-        0.5,
-        breakpoint
-      ),
-
-      height: moderateScale(
-        24,
-        0.5,
-        breakpoint
-      ),
-
-      borderRadius: moderateScale(
-        12,
-        0.5,
-        breakpoint
-      ),
-
-      backgroundColor: COLOR_ERROR,
-
-      justifyContent: 'center',
-      alignItems: 'center',
-
-      paddingHorizontal: moderateScale(
-        6,
-        0.5,
-        breakpoint
-      ),
-
-      borderWidth: 2,
-      borderColor: BG_SURFACE,
-
-      shadowColor: COLOR_ERROR,
-
-      shadowOpacity: 0.4,
-
-      shadowRadius: moderateScale(
-        4,
-        0.5,
-        breakpoint
-      ),
-
-      shadowOffset: {
-        width: 0,
-        height: moderateScale(
-          2,
-          0.5,
-          breakpoint
-        ),
-      },
-
-      elevation: 4,
-
-      zIndex: 10,
-    },
-
-    orderCountBadgeText: {
-      color: BRAND_WHITE,
-
-      fontSize: getFontSize(
-        breakpoint,
-        'sm'
-      ),
-
-      fontWeight: '900',
-
-      lineHeight: moderateScale(
-        16,
-        0.5,
-        breakpoint
-      ),
-
-      textAlign: 'center',
+    statusDot: {
+      width: moderateScale(8, 0.5, breakpoint),
+      height: moderateScale(8, 0.5, breakpoint),
+      borderRadius: moderateScale(4, 0.5, breakpoint),
     },
 
     // --------------------------------------------------------
@@ -1579,6 +1561,7 @@ function createStyles(breakpoint: any) {
       flexDirection: 'row',
 
       alignItems: 'center',
+      alignSelf: 'flex-start',
 
       gap: moderateScale(
         2,
@@ -1586,7 +1569,7 @@ function createStyles(breakpoint: any) {
         breakpoint
       ),
 
-      backgroundColor: BG_SURFACE,
+      backgroundColor: '#FFFBEB',
 
       borderRadius: getBorderRadius(
         breakpoint,
@@ -1606,7 +1589,13 @@ function createStyles(breakpoint: any) {
       ),
 
       borderWidth: 1,
-      borderColor: BORDER_COLOR,
+      borderColor: '#FDE68A',
+
+      marginTop: moderateScale(
+        2,
+        0.5,
+        breakpoint
+      ),
     },
 
     unpaidBillText: {
@@ -1621,10 +1610,12 @@ function createStyles(breakpoint: any) {
     },
 
     // --------------------------------------------------------
-    // TABLE NUMBER
+    // TABLE NUMBER + STATUS + SEATS
     // --------------------------------------------------------
 
     tableCardText: {
+      flex: 1,
+
       fontSize: getFontSize(
         breakpoint,
         'lg'
@@ -1635,35 +1626,30 @@ function createStyles(breakpoint: any) {
         'xl'
       ),
 
-      fontWeight: '900',
+      fontWeight: '800',
 
       textAlign: 'center',
-
-      alignSelf: 'stretch',
 
       color: TEXT_DARK,
     },
 
-    tableCardTextBooked: {
-      color: BRAND_WHITE,
+    tableStatusText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'md'
+      ),
+
+      fontWeight: '700',
+
+      textAlign: 'left',
+
+      color: TEXT_DARK,
     },
 
-    // --------------------------------------------------------
-    // TABLE META
-    // --------------------------------------------------------
-
-    tableCardMeta: {
+    tableSeatsRow: {
       flexDirection: 'row',
 
       alignItems: 'center',
-
-      justifyContent: 'center',
-
-      minHeight: moderateScale(
-        12,
-        0.5,
-        breakpoint
-      ),
 
       gap: moderateScale(
         3,
@@ -1672,118 +1658,45 @@ function createStyles(breakpoint: any) {
       ),
 
       width: '100%',
+    },
+
+    tableSeatsText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'xs'
+      ),
+
+      color: TEXT_MUTED,
+
+      fontWeight: '500',
+    },
+
+    tableOrdersText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'xs'
+      ),
+
+      color: TEXT_MUTED,
+
+      fontWeight: '700',
+    },
+
+    tableExtraText: {
+      fontSize: getFontSize(
+        breakpoint,
+        'xs'
+      ),
+
+      color: TEXT_MUTED,
+
+      fontWeight: '600',
 
       marginTop: moderateScale(
         2,
         0.5,
         breakpoint
       ),
-    },
-
-    tableCardMetaText: {
-      fontSize: getFontSize(
-        breakpoint,
-        'xs'
-      ),
-
-      color: TEXT_MUTED,
-
-      fontWeight: '800',
-    },
-
-    lightMetaText: {
-      color: BRAND_WHITE,
-    },
-
-    reservedMeta: {
-      flexDirection: 'row',
-
-      alignItems: 'center',
-
-      gap: 3,
-    },
-
-    reservedMetaText: {
-      fontSize: getFontSize(
-        breakpoint,
-        'xs'
-      ),
-
-      color: BRAND_WHITE,
-
-      fontWeight: '800',
-    },
-
-    // --------------------------------------------------------
-    // BOOK BUTTON
-    // --------------------------------------------------------
-
-    bookedToggle: {
-      position: 'absolute',
-
-      right: 6,
-      top: 6,
-
-      flexDirection: 'row',
-
-      alignItems: 'center',
-
-      gap: moderateScale(
-        2,
-        0.5,
-        breakpoint
-      ),
-
-      backgroundColor: BG_SURFACE,
-
-      borderRadius: getBorderRadius(
-        breakpoint,
-        'sm'
-      ),
-
-      paddingHorizontal: moderateScale(
-        5,
-        0.5,
-        breakpoint
-      ),
-
-      paddingVertical: moderateScale(
-        2,
-        0.5,
-        breakpoint
-      ),
-
-      borderWidth: 1,
-      borderColor: BORDER_COLOR,
-
-      zIndex: 20,
-
-      ...(Platform.OS === 'web'
-        ? {
-            cursor: 'pointer',
-            transition: 'background-color 0.15s ease, border-color 0.15s ease' as any,
-          }
-        : {}),
-    },
-
-    bookedToggleActive: {
-      backgroundColor: BG_SURFACE,
-      borderColor: COLOR_BOOKED,
-    },
-
-    bookedToggleText: {
-      fontSize: getFontSize(
-        breakpoint,
-        'xs'
-      ),
-
-      color: TEXT_MUTED,
-
-      fontWeight: '800',
-    },
-
-    bookedToggleTextActive: {
-      color: COLOR_BOOKED,
     },
 
     // --------------------------------------------------------

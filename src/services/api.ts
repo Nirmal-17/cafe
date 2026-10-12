@@ -27,10 +27,12 @@ import {
   alternateSchemeUrl,
   describeLoopbackIssue,
   getBaseUrl,
+  MENU_CACHE_STORAGE_KEY,
   normalizeBaseUrl,
   onBaseUrlChange,
   resetBaseUrl,
   setBaseUrl,
+  TABLES_CACHE_STORAGE_KEY,
   validateBaseUrl,
 } from '@/config/apiConfig';
 import type { BaseUrlValidation } from '@/config/apiConfig';
@@ -51,8 +53,12 @@ const FEED_MISS_TTL_MS = 60000;
  * session died, and hiding that behind a "route missing" memory would keep the
  * app signed in against a server that rejected the token.
  */
-const isRouteMissing = (res: ApiResponse<unknown>): boolean =>
-  [404, 405, 301, 302, 303, 307, 308].includes(res.status ?? -1) || /^\s*</.test(res.error || '');
+/** HTTP statuses that mean "this route does not exist on this server". */
+export const ROUTE_MISSING_STATUSES = [301, 302, 303, 307, 308, 404, 405] as const;
+
+export const isRouteMissing = (res: ApiResponse<unknown>): boolean =>
+  (ROUTE_MISSING_STATUSES as readonly number[]).includes(res.status ?? -1) ||
+  /^\s*</.test(res.error || '');
 
 /** Re-type a failed feed request without pretending it carried data. */
 const feedFailure = <T>(res: ApiResponse<unknown>): ApiResponse<T> => ({
@@ -61,6 +67,101 @@ const feedFailure = <T>(res: ApiResponse<unknown>): ApiResponse<T> => ({
   status: res.status,
   aborted: res.aborted,
 });
+
+/**
+ * Tables hidden from the floor plan by request (venue removed them).
+ * Compared spaceless/caseless so "Roof 3", "Roof3" and "roof-3" all match —
+ * while short codes like R3 stay visible.
+ * Currently empty: the venue wants Roof R1..R3 visible again.
+ */
+const HIDDEN_TABLE_NAMES = new Set<string>([]);
+
+export const isHiddenTableName = (tableNumber: unknown): boolean => {
+  const flat = String(tableNumber ?? '')
+    .toLowerCase()
+    .replace(/[\s\-_]+/g, '');
+  return HIDDEN_TABLE_NAMES.has(flat);
+};
+
+// ── Local table status ─────────────────────────────────────────────────────
+// The hosted feed server answers /cafetable/all with read-only rows: there is
+// no route at all to free, reserve or seat a table, so PATCH /tables/:id/status
+// can only ever come back 404 there. Remembering the change on this device and
+// re-applying it over every table read keeps those buttons working instead of
+// failing the action with a raw HTTP error. A server that does accept the PATCH
+// clears the entry again (see updateTableStatus), and entries are stored per
+// server URL so one host's local state never leaks into another.
+/** Storage key hydrated before first paint — see PERSISTED_KEYS in _layout.tsx. */
+export const TABLE_STATUS_OVERRIDES_KEY = 'smart_cafe_table_status_overrides';
+
+type StatusOverrides = Record<string, Record<string, string>>;
+
+const readStatusOverrides = (): StatusOverrides => {
+  try {
+    const raw = getStorageItemSync(TABLE_STATUS_OVERRIDES_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as StatusOverrides)
+      : {};
+  } catch {
+    return {};
+  }
+};
+
+/** Remember a status change this server could not accept. */
+const rememberStatusOverride = (baseUrl: string, tableId: number, status: string): void => {
+  const all = readStatusOverrides();
+  all[baseUrl] = { ...(all[baseUrl] || {}), [String(tableId)]: String(status).toUpperCase() };
+  setStorageItemSync(TABLE_STATUS_OVERRIDES_KEY, JSON.stringify(all));
+};
+
+/** Drop a local stand-in — the server's own value is authoritative again. */
+const forgetStatusOverride = (baseUrl: string, tableId: number): void => {
+  const all = readStatusOverrides();
+  const bucket = all[baseUrl];
+  if (!bucket || !(String(tableId) in bucket)) return;
+  delete bucket[String(tableId)];
+  if (Object.keys(bucket).length === 0) delete all[baseUrl];
+  setStorageItemSync(TABLE_STATUS_OVERRIDES_KEY, JSON.stringify(all));
+};
+
+/**
+ * Apply this server's remembered statuses over a table snapshot. `is_reserved`
+ * is rewritten alongside `status` because the UI treats either flag as
+ * "reserved" — updating only one would leave the tile stuck.
+ */
+const applyLocalStatusOverrides = (baseUrl: string, tables: Table[]): Table[] => {
+  const bucket = readStatusOverrides()[baseUrl];
+  if (!bucket) return tables;
+  return tables.map((table) => {
+    const local = bucket[String(table.id)];
+    if (!local || local === table.status) return table;
+    return {
+      ...table,
+      status: local as Table['status'],
+      is_reserved: local === 'RESERVED',
+    };
+  });
+};
+
+/**
+ * Explain a response that was not JSON. The hosted server answers a missing
+ * route with an empty 404 (and unauthenticated paths with its HTML login
+ * page), which used to reach the UI verbatim as the useless
+ * "Invalid server response (HTTP 404)".
+ */
+const describeNonJsonResponse = (status: number, label: string, body: string): string => {
+  const trimmed = (body || '').trim();
+  if (/^\s*</.test(trimmed)) {
+    return `The server sent a web page instead of API data (HTTP ${status}) — check the server URL`;
+  }
+  if (!trimmed) {
+    return status === 404 || status === 405
+      ? `${label} is not available on this server (HTTP ${status})`
+      : `Empty response from ${label} (HTTP ${status})`;
+  }
+  return trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed;
+};
 
 export interface ApiResponse<T> {
   success: boolean;
@@ -81,12 +182,19 @@ export interface Section {
   _count?: { tables: number };
 }
 
+export type DiningArea = 'indoor' | 'outdoor' | 'tables' | 'roof' | 'cabin' | 'hall' | 'garden' | 'pool' | 'room';
+
+export type ServiceType = 'dine-in' | 'delivery' | 'takeaway';
+
 export interface Table {
   id: number;
   sectionId: number;
   tableNumber: string;
   capacity: number;
-  status: 'AVAILABLE' | 'OCCUPIED' | 'RESERVED' | 'CLEANING' | 'PENDING_BILL';
+  // Reserve-only floor plan: a table is either Free or Reserved.
+  // Legacy server values (OCCUPIED / PENDING_BILL / CLEANING) are normalized
+  // to AVAILABLE on the way in — see normalizeTableStatus().
+  status: 'AVAILABLE' | 'RESERVED';
   is_reserved?: boolean;
   createdAt?: string;
   section?: { id: number; name: string };
@@ -98,6 +206,8 @@ export interface Table {
     closedAt?: string | null;
     waiter?: { id: number; name: string };
   } | null;
+  diningArea?: DiningArea;
+  serviceType?: ServiceType;
 }
 
 export interface MenuItem {
@@ -144,7 +254,7 @@ export interface CafeTable {
   tableCategoryId: number;
   tableNumber: string;
   capacity: number;
-  status: 'AVAILABLE' | 'OCCUPIED' | 'RESERVED' | 'CLEANING' | 'PENDING_BILL';
+  status: 'AVAILABLE' | 'RESERVED';
   isReserved?: boolean;
   createdAt?: string;
   tableCategory?: { id: number; name: string };
@@ -179,7 +289,7 @@ export interface StaffUser {
   id: number;
   name: string;
   email: string;
-  role: 'WAITER' | 'CHEF' | 'CASHIER' | 'ADMIN';
+  role: 'WAITER' | 'ADMIN';
   createdAt?: string;
 }
 
@@ -221,6 +331,32 @@ export interface CafeSettings {
   taxRate: string;
   serviceChargeRate: string;
   receiptFooter: string;
+  /** Server-side receipt printing flag (GET /api/settings, api.txt §2). */
+  printerEnabled?: boolean;
+}
+
+/** Payment methods accepted by POST /api/cashier/checkout (api.txt §6). */
+export type PaymentMethod = 'CASH' | 'CARD' | 'UPI' | 'QR';
+
+/** A row of GET /api/cashier/unpaid-bills (api.txt §6 — a loosely typed list). */
+export interface UnpaidBill {
+  id: number;
+  tableId?: number;
+  orderIds?: number[];
+  totalAmount?: number;
+  amount?: number;
+  paymentStatus?: string;
+  status?: string;
+  createdAt?: string;
+}
+
+/** Response of POST /api/cashier/checkout (api.txt §6). */
+export interface CheckoutResult {
+  payment?: { id: number; method: string; status: string; amount?: number };
+  order?: { id: number; paymentStatus: string; status?: string };
+  orders?: { id: number; paymentStatus: string; status?: string }[];
+  table?: Table;
+  message?: string;
 }
 
 export interface DashboardData {
@@ -281,21 +417,66 @@ export interface DashboardData {
   };
 }
 
-const KNOWN_ROLES = ['WAITER', 'CHEF', 'CASHIER', 'ADMIN'] as const;
+const KNOWN_ROLES = ['WAITER', 'ADMIN'] as const;
+
+/** Only Admin and Waiter accounts exist in the app — every other role is refused at login. */
+const ALLOWED_LOGIN_ROLES: readonly StaffUser['role'][] = ['ADMIN', 'WAITER'];
 
 /**
- * Coerce whatever the server calls a role into the four the UI switches on.
- * Backends spell it differently (lower case, spaces, an id, "Kitchen"), and an
- * unknown value used to reach the role-gated tabs as `undefined`.
+ * Coerce whatever the server calls a role into the two the app supports.
+ * Backends spell it differently (lower case, spaces, "Manager"), and a
+ * CHEF/CASHIER/unknown value passes through untouched so the login gate can
+ * refuse it with the real role name instead of silently promoting it.
  */
-function normalizeRole(value: unknown): StaffUser['role'] {
+function normalizeRole(value: unknown): string {
   const raw = String(value ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_');
-  if ((KNOWN_ROLES as readonly string[]).includes(raw)) return raw as StaffUser['role'];
+  if ((KNOWN_ROLES as readonly string[]).includes(raw)) return raw;
   if (raw.includes('WAITER') || raw.includes('SERV')) return 'WAITER';
-  if (raw.includes('CHEF') || raw.includes('KITCHEN') || raw.includes('COOK')) return 'CHEF';
-  if (raw.includes('CASH')) return 'CASHIER';
   if (raw.includes('ADMIN') || raw.includes('MANAGER')) return 'ADMIN';
-  return 'WAITER';
+  return raw;
+}
+
+/**
+ * Normalize the nested GET /api/menu payload (api.txt §4): categories carry
+ * `items`, and every item must reach the screens with the fields they assume
+ * (id, categoryId, name, price, available) even when the server omits some.
+ * Without this, a missing categoryId would silently break the category chips
+ * on the order screen.
+ */
+/**
+ * Reserve-only normalization: anything that is not an explicit reservation
+ * reads as Free. Servers that still report OCCUPIED / PENDING_BILL / CLEANING
+ * keep working — their tables simply show as Free until reserved.
+ */
+export function normalizeTableStatus(raw: unknown, isReserved?: boolean): Table['status'] {
+  if (String(raw ?? '').toUpperCase() === 'RESERVED' || isReserved === true) return 'RESERVED';
+  return 'AVAILABLE';
+}
+
+export function isReservedTable(table: Pick<Table, 'status' | 'is_reserved'> | null | undefined): boolean {
+  if (!table) return false;
+  return normalizeTableStatus(table.status, (table as { is_reserved?: boolean }).is_reserved) === 'RESERVED';
+}
+
+function normalizeMenuCategories(categories: MenuCategory[]): MenuCategory[] {
+  return categories
+    .filter((cat): cat is MenuCategory => Boolean(cat) && typeof cat === 'object')
+    .map((cat) => ({
+      ...cat,
+      id: Number(cat.id),
+      name: String(cat.name ?? '').trim() || `Category ${cat.id}`,
+      description: cat.description ?? null,
+      items: (Array.isArray(cat.items) ? cat.items : []).map((item) => ({
+        ...item,
+        id: Number(item?.id),
+        categoryId: Number(item?.categoryId ?? cat.id),
+        name: String(item?.name ?? '').trim() || `Item ${item?.id}`,
+        price: Number(item?.price ?? 0),
+        description: item?.description ?? null,
+        image: item?.image ?? null,
+        available: item?.available !== false,
+      })),
+    }));
 }
 
 class ApiService {
@@ -361,7 +542,7 @@ class ApiService {
     this.invalidateMenuCache();
     this.feedCache.clear();
     this.feedInFlight.clear();
-    removeStorageItemSync('smart_cafe_cached_tables');
+    removeStorageItemSync(TABLES_CACHE_STORAGE_KEY);
     removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
   }
 
@@ -539,7 +720,11 @@ class ApiService {
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       const text = await response.text().catch(() => '');
-      return { success: false, error: text || `Invalid server response (HTTP ${response.status})`, status: response.status };
+      return {
+        success: false,
+        error: describeNonJsonResponse(response.status, formattedPath, text),
+        status: response.status,
+      };
     }
 
     const data = await response.json().catch(() => ({} as any));
@@ -579,11 +764,15 @@ class ApiService {
       // the route itself is missing do we retry the other, so a 404 never turns
       // into "Route not found" on the login screen.
       let response: Response | undefined;
+      let attemptedPath = '/api/account/login';
       for (const path of ['/api/auth/login', '/api/account/login']) {
+        attemptedPath = path;
         response = await fetch(`${this.baseUrl}${path}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password }),
+          // `email` rides along with `username`: servers in the wild accept
+          // either spelling, and the account's address is what staff type.
+          body: JSON.stringify({ username, email: username, password }),
           signal: timeoutController.signal,
         });
         if (response.status !== 404) break;
@@ -597,7 +786,7 @@ class ApiService {
         const text = await response.text().catch(() => '');
         return {
           success: false,
-          error: text || `Invalid server response from ${this.baseUrl} (HTTP ${response.status})`,
+          error: describeNonJsonResponse(response.status, attemptedPath, text),
           status: response.status,
         };
       }
@@ -621,13 +810,73 @@ class ApiService {
         payload?.token || payload?.access_token || payload?.accessToken || payload?.jwt;
       if (response.ok && token) {
         const rawUser = payload.user && typeof payload.user === 'object' ? payload.user : null;
+        const rawRole = rawUser?.role ?? payload.role;
         const user: StaffUser = {
           id: rawUser?.id ?? payload.user_id ?? payload.id,
           name: rawUser?.name ?? payload.full_name ?? payload.name ?? username,
           email: (rawUser?.email ?? payload.email) || username,
-          role: normalizeRole(rawUser?.role ?? payload.role),
+          role: 'WAITER',
         };
+        let role: string | null =
+          rawRole === undefined || rawRole === null || String(rawRole).trim() === ''
+            ? null
+            : normalizeRole(rawRole);
+
+        // The login payload is not required to carry the role — api.txt §1
+        // documents GET /auth/me as the staff profile, so ask the server
+        // before letting the account past the login screen.
+        const previousToken = this.token;
         this.setToken(token);
+        if (!role) {
+          const me = await this.getMe();
+          if (me.success && me.data) {
+            role = me.data.role;
+            user.id = me.data.id || user.id;
+            user.name = me.data.name || user.name;
+            user.email = me.data.email || user.email;
+          } else if (me.status && (ROUTE_MISSING_STATUSES as readonly number[]).includes(me.status)) {
+            // This host has no staff-profile route at all: the production feed
+            // server answers /auth/me with a 404 and its login payload carries
+            // no role either. The password WAS checked by that server, so sign
+            // the account in as the least-privileged allowed role rather than
+            // refuse a correct password over a field the server never sends.
+            role = 'WAITER';
+          } else {
+            // The server exists but could not say who signed in (expired token,
+            // server error, unreachable) - that is a real failure, not a
+            // missing route, so it reaches the user as-is.
+            this.setToken(previousToken);
+            return {
+              success: false,
+              error:
+                me.error ||
+                "Couldn't verify this account's role - the server must report it at login or via GET /auth/me.",
+              status: me.status || 403,
+            };
+          }
+        }
+        // Gate: only Admin and Waiter accounts may enter — every other role is
+        // refused with the reason instead of a session it cannot use. An
+        // unknown role is also refused: the restriction can only be enforced
+        // when the server reports who is signing in (api.txt §1 /auth/me).
+        if (role && !(ALLOWED_LOGIN_ROLES as readonly string[]).includes(role)) {
+          this.setToken(previousToken);
+          return {
+            success: false,
+            error: `Only Admin and Waiter accounts can sign in — this account is ${role.toLowerCase()}.`,
+            status: 403,
+          };
+        }
+        if (!role) {
+          this.setToken(previousToken);
+          return {
+            success: false,
+            error: "Couldn't verify this account's role — the server must report it at login or via GET /auth/me.",
+            status: 403,
+          };
+        }
+
+        user.role = role as StaffUser['role'];
         saveSession(this.baseUrl, { token, user, username: username.trim() });
         this.invalidateMenuCache();
         // Signing in can unlock session-gated feeds (/tablecategory/all) that
@@ -682,7 +931,7 @@ class ApiService {
     this.invalidateMenuCache();
     this.feedCache.clear();
     this.feedInFlight.clear();
-    removeStorageItemSync('smart_cafe_cached_tables');
+    removeStorageItemSync(TABLES_CACHE_STORAGE_KEY);
     removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
     if (!token) {
       return { success: true, data: { message: 'Signed out' }, status: 200 };
@@ -696,9 +945,70 @@ class ApiService {
     });
   }
 
+  /**
+   * GET /auth/me — the server's own picture of the signed-in staff user
+   * (api.txt §1). Used right after login when the login payload omits the
+   * role, and available for any screen that needs a fresh profile.
+   */
+  async getMe(): Promise<ApiResponse<StaffUser>> {
+    const res = await this.request<Record<string, unknown>>('/auth/me');
+    if (!res.success || !res.data) {
+      return { success: false, error: res.error, status: res.status, aborted: res.aborted };
+    }
+    const raw = res.data;
+    return {
+      success: true,
+      status: res.status,
+      data: {
+        id: Number(raw.id ?? 0),
+        name: String(raw.name ?? ''),
+        email: String(raw.email ?? ''),
+        role: normalizeRole(raw.role) as StaffUser['role'],
+        createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : undefined,
+      },
+    };
+  }
+
   // ─── Settings ─────────────────────────────────────────────────────────────
-  async getSettings() {
-    return this.request<CafeSettings>('/settings');
+  /**
+   * Cafe configuration (api.txt §2): `{ cafeName, currency, taxRate,
+   * serviceChargeRate, printerEnabled }`. Older builds spelled the money
+   * symbol `currencySymbol` and shipped extra fields — both shapes normalize
+   * into the one CafeSettings the screens render, so currency and charges
+   * never silently fall back to defaults.
+   */
+  async getSettings(): Promise<ApiResponse<CafeSettings>> {
+    const res = await this.request<Record<string, unknown>>('/settings');
+    if (!res.success || !res.data) {
+      return { success: false, error: res.error, status: res.status, aborted: res.aborted };
+    }
+    const raw = res.data;
+    const pick = (...keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const value = raw[key];
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+          return String(value);
+        }
+      }
+      return undefined;
+    };
+    return {
+      success: true,
+      status: res.status,
+      data: {
+        cafeName: pick('cafeName', 'name') ?? 'CafeOS',
+        address: pick('address') ?? '',
+        phone: pick('phone') ?? '',
+        currencySymbol: pick('currency', 'currencySymbol') ?? 'NPR',
+        taxRate: pick('taxRate') ?? '0',
+        serviceChargeRate: pick('serviceChargeRate') ?? '0',
+        receiptFooter: pick('receiptFooter') ?? '',
+        printerEnabled:
+          raw.printerEnabled === undefined || raw.printerEnabled === null
+            ? undefined
+            : Boolean(raw.printerEnabled),
+      },
+    };
   }
 
   // ─── Sections ─────────────────────────────────────────────────────────────
@@ -743,7 +1053,9 @@ class ApiService {
     if (!this.canFallback(res)) return res;
 
     const feed = await this.requestFeed<RemoteCafeTable[]>('cafetable', '/cafetable/all');
-    if (feed.success && feed.data) return this.serveTables(feed.data.map(mapCafeTableToTable), sectionId);
+    if (feed.success && feed.data) {
+      return this.serveTables(feed.data.map(mapCafeTableToTable), sectionId);
+    }
 
     // Both routes failed — surface whichever explains the situation: the feed
     // error when /tables is simply not implemented here, the /tables error
@@ -751,20 +1063,47 @@ class ApiService {
     return this.hasRouteMiss('tables') ? feedFailure<Table[]>(feed) : res;
   }
 
-  /** Persist the snapshot the name resolvers read, then apply the section filter. */
+  /**
+   * Persist the snapshot the name resolvers read, then apply the section filter.
+   * Status changes this server could not store are laid over the rows here, so
+   * every read — the floor plan, a table detail, the next refresh — agrees with
+   * what the user just did instead of flipping back to the feed's value.
+   */
   private serveTables(tables: Table[], sectionId?: number): ApiResponse<Table[]> {
-    const serialized = JSON.stringify(tables);
-    if (getStorageItemSync('smart_cafe_cached_tables') !== serialized) {
-      setStorageItemSync('smart_cafe_cached_tables', serialized);
+    const normalized = tables
+      .filter((t) => !isHiddenTableName((t as { tableNumber?: unknown }).tableNumber))
+      .map((t) => ({
+        ...t,
+        status: normalizeTableStatus((t as { status?: unknown }).status, t.is_reserved),
+        is_reserved: isReservedTable(t as Table),
+      }));
+    const rows = applyLocalStatusOverrides(this.baseUrl, normalized);
+    const serialized = JSON.stringify(rows);
+    if (getStorageItemSync(TABLES_CACHE_STORAGE_KEY) !== serialized) {
+      setStorageItemSync(TABLES_CACHE_STORAGE_KEY, serialized);
       this.invalidateResolveCaches();
     }
-    const filtered = sectionId ? tables.filter((t) => t.sectionId === sectionId) : tables;
+    const filtered = sectionId ? rows.filter((t) => t.sectionId === sectionId) : rows;
     return { success: true, data: filtered };
   }
 
   async getTable(id: number): Promise<ApiResponse<TableDetail>> {
     const res = await this.request<TableDetail>(`/tables/${id}`);
-    if (res.success) return res;
+    if (res.success) {
+      // This route answers directly (it never passes serveTables), so a status
+      // this device changed locally has to be laid over it here as well.
+      if (!res.data) return res;
+      if (isHiddenTableName((res.data as { tableNumber?: unknown }).tableNumber)) {
+        return { success: false, error: 'Table not found', status: 404 };
+      }
+      const normalized = {
+        ...res.data,
+        status: normalizeTableStatus((res.data as { status?: unknown }).status, res.data.is_reserved),
+        is_reserved: isReservedTable(res.data as Table),
+      };
+      const overlaid = applyLocalStatusOverrides(this.baseUrl, [normalized])[0];
+      return overlaid === normalized ? { ...res, data: normalized } : { ...res, data: overlaid };
+    }
     if (!this.canFallback(res)) return res;
 
     // Hosted server: table detail is a row of the cafetable feed. It carries
@@ -776,29 +1115,60 @@ class ApiService {
     return { success: true, data: { ...found, orders: [], activeOrders: [] }, status: res.status };
   }
 
+  /**
+   * Reserve / free a table (the only two table states). Servers implementing
+   * the api.txt contract answer PATCH /tables/:id/status; a read-only feed
+   * host has no such route, and failing there with a raw 404 would break
+   * "Free Table" / "Reserve" for no reason — so the change is remembered on
+   * this device and re-applied over every table read instead.
+   */
   async updateTableStatus(id: number, status: string): Promise<ApiResponse<Table>> {
-    return this.request<Table>(`/tables/${id}/status`, {
+    const res = await this.request<Table>(`/tables/${id}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     });
+    if (res.success) {
+      // The server stored it — a local stand-in would only shadow it now.
+      forgetStatusOverride(this.baseUrl, id);
+      return res;
+    }
+    // Auth, network and server faults keep their old, honest error path.
+    if (!isRouteMissing(res)) return res;
+
+    rememberStatusOverride(this.baseUrl, id, status);
+    const found = await this.getTable(id);
+    if (found.success && found.data) return { success: true, data: found.data, status: res.status };
+    // The feed is unreadable too — hand back just enough for the caller's
+    // optimistic patch ({ ...table, ...server }) without clobbering its name.
+    return {
+      success: true,
+      data: { id, status: status as Table['status'] } as Table,
+      status: res.status,
+    };
   }
 
+  /**
+   * Reserve-only: "Take Order" needs no dining session and never changes table
+   * status. Kept for callers that still invoke it — it simply verifies the
+   * table exists and reports success so the order pad can open.
+   */
   async startTableSession(id: number): Promise<ApiResponse<{ session: any; table: Table }>> {
-    return this.request<{ session: any; table: Table }>(`/tables/${id}/session`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-    });
+    const found = await this.getTable(id);
+    if (!found.success || !found.data) {
+      return feedFailure<{ session: any; table: Table }>(found);
+    }
+    return { success: true, status: found.status, data: { session: null, table: found.data } };
   }
 
   // ─── Menu ─────────────────────────────────────────────────────────────────
   /** Drop the persisted menu snapshot (stale or cross-server data) and its lookup caches. */
   invalidateMenuCache() {
-    removeStorageItemSync('smart_cafe_cached_menu');
+    removeStorageItemSync(MENU_CACHE_STORAGE_KEY);
     this.invalidateResolveCaches();
   }
 
   private readCachedMenu(): MenuCategory[] | null {
-    const cachedRaw = getStorageItemSync('smart_cafe_cached_menu');
+    const cachedRaw = getStorageItemSync(MENU_CACHE_STORAGE_KEY);
     if (!cachedRaw) return null;
     try {
       const parsed = JSON.parse(cachedRaw) as MenuCategory[];
@@ -810,16 +1180,21 @@ class ApiService {
 
   /**
    * Fresh menu straight from the server.
-   * Primary source is the flat production catalogue (/menu-item/all) folded
-   * with /menucategory/all for category names and order and the legacy explore
-   * feed for item order; servers that expose none of them (the local backend)
-   * fall back to the nested /menu payload. A host that never answered is not
-   * retried — a dead connection would only burn a second full timeout.
+   * GET /api/menu is the documented source (api.txt §4): nested categories,
+   * each carrying its items. Servers that predate it expose the flat
+   * production feeds instead (/menu-item/all + /menucategory/all + the legacy
+   * explore feed) — those remain the fallback. A host that never answered is
+   * not retried, so a dead connection can't burn a second full timeout.
    */
   private async fetchServerMenu(requestKey?: string): Promise<ApiResponse<MenuCategory[]>> {
     // requestFeed keeps concurrent menu loads on one in-flight request and,
-    // on a server without the flat feeds, remembers the miss so the fallback
-    // to /menu starts immediately instead of re-probing every refresh.
+    // on a server without the route, remembers the miss so the flat-feed
+    // fallback starts immediately instead of re-probing every refresh.
+    const nested = await this.requestFeed<MenuCategory[]>('menu', '/menu');
+    if (nested.success && Array.isArray(nested.data) && nested.data.length > 0) {
+      return { success: true, status: nested.status, data: normalizeMenuCategories(nested.data) };
+    }
+
     const [itemsRes, categoriesRes, exploreRes] = await Promise.all([
       this.requestFeed<RemoteMenuItem[]>('menu-item', '/menu-item/all'),
       this.requestFeed<RemoteMenuCategory[]>('menucategory', '/menucategory/all'),
@@ -834,11 +1209,19 @@ class ApiService {
       return { success: true, data: buildMenuCategories(itemsRes.data, entries, exploreRows), status: itemsRes.status };
     }
 
+    // Neither shape returned data: surface the failure that explains the
+    // situation — a dead connection over whichever route was tried, the
+    // documented /menu error when both shapes are absent, or an empty menu.
+    if (nested.status === 0 || nested.aborted) {
+      return { success: false, error: nested.error, status: nested.status, aborted: nested.aborted };
+    }
     if (itemsRes.status === 0 || itemsRes.aborted) {
       return { success: false, error: itemsRes.error, status: itemsRes.status, aborted: itemsRes.aborted };
     }
-
-    return this.request<MenuCategory[]>('/menu', { requestKey });
+    if (nested.success) {
+      return { success: false, error: 'The menu on this server is empty', status: nested.status };
+    }
+    return nested;
   }
 
   /**
@@ -851,7 +1234,7 @@ class ApiService {
     const fetchFresh = async (): Promise<ApiResponse<MenuCategory[]>> => {
       const res = await this.fetchServerMenu(options?.requestKey);
       if (res.success && res.data) {
-        setStorageItemSync('smart_cafe_cached_menu', JSON.stringify(res.data));
+        setStorageItemSync(MENU_CACHE_STORAGE_KEY, JSON.stringify(res.data));
         this.invalidateResolveCaches();
       }
       return res;
@@ -890,7 +1273,11 @@ class ApiService {
   async getCafeTables(): Promise<ApiResponse<CafeTable[]>> {
     const res = await this.requestFeed<RemoteCafeTable[]>('cafetable', '/cafetable/all');
     if (!res.success || !res.data) return feedFailure<CafeTable[]>(res);
-    return { success: true, data: res.data.map(mapCafeTable), status: res.status };
+    return {
+      success: true,
+      data: res.data.map(mapCafeTable).filter((t) => !isHiddenTableName(t.tableNumber)),
+      status: res.status,
+    };
   }
 
   // ─── Menu Categories (flat list) ──────────────────────────────────────────
@@ -944,7 +1331,30 @@ class ApiService {
     if (params?.waiterId) query.set('waiterId', String(params.waiterId));
     if (params?.dateFrom) query.set('dateFrom', params.dateFrom);
     if (params?.dateTo) query.set('dateTo', params.dateTo);
-    return this.request(`/orders?${query.toString()}`) as Promise<ApiResponse<{ orders: Order[]; page: number; limit: number; total: number; hasMore: boolean }>>;
+    const res = await this.request<{ orders: Order[]; page: number; limit: number; total: number; hasMore: boolean }>(`/orders?${query.toString()}`);
+    if (res.success) return res;
+
+    // api.txt documents no order-list route — servers without one still have
+    // GET /orders/active, so history/dashboard screens degrade to "what is
+    // open now" instead of a dead screen. A real failure (500, unreachable)
+    // is surfaced as-is: only a missing route qualifies for the fallback.
+    if (isRouteMissing(res)) {
+      const active = await this.getActiveOrders('orders-list-fallback');
+      if (active.success && active.data) {
+        return {
+          success: true,
+          status: active.status,
+          data: {
+            orders: active.data,
+            page: 1,
+            limit: active.data.length,
+            total: active.data.length,
+            hasMore: false,
+          },
+        };
+      }
+    }
+    return res;
   }
 
   async getActiveOrders(requestKey?: string) {
@@ -993,10 +1403,18 @@ class ApiService {
   }
 
   async cancelOrder(id: number, reason?: string) {
-    const response = await this.request<Order>(`/orders/${id}/cancel`, {
+    let response = await this.request<Order>(`/orders/${id}/cancel`, {
       method: 'POST',
       body: JSON.stringify({ reason }),
     });
+    // api.txt models cancellation as a plain status transition — servers
+    // without the dedicated /cancel route still honour PATCH /orders/:id/status.
+    if (!response.success && isRouteMissing(response)) {
+      response = await this.request<Order>(`/orders/${id}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'CANCELLED', reason }),
+      });
+    }
     if (response.success) {
       const cached = this.getCachedActiveOrders();
       this.saveCachedActiveOrders(cached.map((order) => order.id === id ? response.data! : order));
@@ -1014,6 +1432,38 @@ class ApiService {
     return this.request<{ message: string; orderId: number; printer: { configured: boolean; host: string | null; port: number; queueLength: number; nextJobId: number } }>(`/orders/${orderId}/print`, {
       method: 'POST',
     });
+  }
+
+  // ─── QR & Cashier payments (api.txt §6) ───────────────────────────────────
+  /** Payment QR code shown to the customer — GET /api/qr. */
+  async getQr(): Promise<ApiResponse<{ qrUrl: string }>> {
+    return this.request<{ qrUrl: string }>('/qr');
+  }
+
+  /** Bills waiting to be settled — GET /api/cashier/unpaid-bills. */
+  async getUnpaidBills(): Promise<ApiResponse<UnpaidBill[]>> {
+    return this.request<UnpaidBill[]>('/cashier/unpaid-bills');
+  }
+
+  /**
+   * Settle a table's bill — POST /api/cashier/checkout with
+   * { tableId, orderIds, paymentMethod, amountPaid }. On success the local
+   * active-order mirror is dropped so paid orders can't resurface from cache.
+   */
+  async cashierCheckout(payload: {
+    tableId: number;
+    orderIds: number[];
+    paymentMethod: PaymentMethod;
+    amountPaid: number;
+  }): Promise<ApiResponse<CheckoutResult>> {
+    const res = await this.request<CheckoutResult>('/cashier/checkout', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (res.success) {
+      removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
+    }
+    return res;
   }
 
   // ─── Notifications (per-user read/clear) ───────────────────────────────────
@@ -1057,7 +1507,7 @@ class ApiService {
     }
 
     try {
-      const cachedRaw = getStorageItemSync('smart_cafe_cached_menu');
+      const cachedRaw = getStorageItemSync(MENU_CACHE_STORAGE_KEY);
       if (cachedRaw) {
         const version = this._cacheGeneration;
         if (this._menuItemCacheVersion !== version) {
@@ -1088,7 +1538,7 @@ class ApiService {
     }
 
     try {
-      const cachedRaw = getStorageItemSync('smart_cafe_cached_tables');
+      const cachedRaw = getStorageItemSync(TABLES_CACHE_STORAGE_KEY);
       if (cachedRaw) {
         const version = this._cacheGeneration;
         if (this._tableCacheVersion !== version) {

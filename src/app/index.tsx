@@ -24,7 +24,7 @@ import Animated, { FadeIn, FadeOut, SlideInLeft, SlideOutLeft } from 'react-nati
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { TableTabIcon } from '@/components/TableTabIcon';
-import { api, Table, Section, Order, StaffUser } from '@/services/api';
+import { api, Table, Section, Order, StaffUser, isReservedTable } from '@/services/api';
 import { homeApi } from '@/services/homeApi';
 import { orderApi } from '@/services/orderApi';
 import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
@@ -44,8 +44,17 @@ import { notifyOrderServed } from '@/utils/orderServedToast';
 import { notifyBillRequested } from '@/utils/orderBillToast';
 import { notifyPrintProceeded } from '@/utils/printProceededToast';
 import { showBottomToast } from '@/components/BottomToast';
-import { subscribeMainTabSwitch } from '@/utils/mainTab';
+import { subscribeMainTabSwitch, subscribeMainRefresh } from '@/utils/mainTab';
+import { resolveTableSectionName } from '@/utils/tableSections';
 import { isOpenOrder } from '@/utils/openValue';
+import {
+  assignReservationId,
+  getReservationId,
+  releaseReservationId,
+  restoreReservationId,
+  syncReservationIds,
+  useReservationId,
+} from '@/utils/reservations';
 import { formatMoney } from '@/components/dashboard/shared';
 
 // ── Modular Screens ──
@@ -56,14 +65,12 @@ import { MenuScreen } from '@/components/screens/MenuScreen';
 import { DashboardScreen } from '@/components/screens/DashboardScreen';
 import { PastOrdersScreen } from '@/components/screens/PastOrdersScreen';
 import { NotificationScreen } from '@/components/screens/NotificationScreen';
-import { KitchenScreen } from '@/components/screens/KitchenScreen';
 
 // ── Strict Color Palette (Dark Blue Primary) ──
 const BRAND_PRIMARY = '#073F78';   // Dark Blue - Primary
 const BRAND_ORANGE = '#FF6D00';    // Brand Orange - Secondary
 const BRAND_YELLOW = '#FFD600';    // Yellow - Accent
 const COLOR_SUCCESS = '#16A34A';   // Green
-const COLOR_WARNING = '#F97316';   // Orange
 const COLOR_PENDING = '#EAB308';   // Yellow (Pending)
 const COLOR_ERROR = '#D32F2F';     // Error Red
 const COLOR_MUTED = '#6B7280';     // Gray
@@ -93,6 +100,8 @@ export default function MainAppContainer() {
   // ── Auth State ──
   // The active session belongs to the configured server URL: each URL keeps its
   // own token/user, so switching servers switches (or drops) the login.
+  // Web and Expo share the same rule: a saved session restores the login, so
+  // the same credentials show the same tables/orders/activities on both.
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
     const session = loadSession(api.getBaseUrl());
     if (session) {
@@ -108,31 +117,26 @@ export default function MainAppContainer() {
   });
 
   // ── Tab State ──
-  const [activeTab, setActiveTab] = useState<'home' | 'dashboard' | 'menu' | 'orders' | 'profile' | 'history' | 'kitchen' | 'notifications'>(() => {
+  const [activeTab, setActiveTab] = useState<'home' | 'dashboard' | 'menu' | 'orders' | 'profile' | 'history' | 'notifications'>(() => {
     const savedTab = getStorageItemSync('smart_cafe_active_tab');
     if (savedTab) {
-      const tabs = ['home', 'dashboard', 'menu', 'orders', 'profile', 'history', 'kitchen', 'notifications'];
+      const tabs = ['home', 'dashboard', 'menu', 'orders', 'profile', 'history', 'notifications'];
       if (tabs.includes(savedTab)) return savedTab as any;
     }
     return 'dashboard';
   });
 
-  // Role-based tab visibility
+  // Role-based tab visibility — Admin and Waiter only.
+  // Parity: waiter sees everything admin sees. Keep the same
+  // list for both roles so future tab additions apply to both in parallel.
   const isWaiter = user?.role === 'WAITER';
-  const isChef = user?.role === 'CHEF';
-  const isCashier = user?.role === 'CASHIER';
   const isAdmin = user?.role === 'ADMIN';
 
-  // Waiters: Dashboard, Home, Orders, Menu, Notifications — no Kitchen
-  // Chefs: Kitchen, Orders — no tables/dashboard
-  // Cashiers: Orders, Menu — no tables/kitchen
-  // Admin: everything
+  // Admin: everything. Waiter: same as admin (Dashboard, Home, Orders, Menu, Notifications).
   const visibleTabs: string[] = (() => {
     if (isAdmin) return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
     if (isWaiter) return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
-    if (isChef) return ['kitchen', 'orders'];
-    if (isCashier) return ['orders', 'menu'];
-    return ['dashboard', 'home', 'orders', 'menu', 'kitchen', 'notifications'];
+    return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
   })();
 
   // ── Side Drawer (absolute overlay — never squeezes the main column) ──
@@ -196,7 +200,8 @@ export default function MainAppContainer() {
   }, []);
 
   const [selectedTableForModal, setSelectedTableForModal] = useState<Table | null>(null);
-  const [startingService, setStartingService] = useState(false);
+  // RES-#### code minted when this table was booked (null when it is not reserved).
+  const modalReservationId = useReservationId(selectedTableForModal?.id ?? null);
   const [updatingTableStatus, setUpdatingTableStatus] = useState(false);
 
   // ── Active Orders States ──
@@ -344,6 +349,59 @@ export default function MainAppContainer() {
     });
   }, [fetchTodayBill, activeOrders]);
 
+  // Reserve/free is local truth first: the flip must survive the next refetch
+  // even when the server cannot persist it (read-only / hosted table APIs).
+  // Keyed by table id; dropped as soon as the server agrees or the TTL lapses.
+  const tableStatusOverridesRef = useRef<Map<number, { status: string; at: number }>>(new Map());
+  const TABLE_STATUS_OVERRIDE_TTL_MS = 10 * 60 * 1000;
+
+  const setTableStatusOverride = useCallback((tableId: number, status: string) => {
+    tableStatusOverridesRef.current.set(tableId, {
+      status: String(status).toUpperCase(),
+      at: Date.now(),
+    });
+  }, []);
+  const clearTableStatusOverride = useCallback((tableId: number) => {
+    tableStatusOverridesRef.current.delete(tableId);
+  }, []);
+
+  /** Re-apply live overrides to a server snapshot; agreed/expired rows drop theirs. */
+  const withTableStatusOverrides = useCallback((list: Table[]): Table[] => {
+    const map = tableStatusOverridesRef.current;
+    if (map.size === 0) return list;
+    const now = Date.now();
+    return list.map((t) => {
+      const override = map.get(t.id);
+      if (!override) return t;
+      const serverStatus = String(t.status ?? '').toUpperCase();
+      if (serverStatus === override.status || now - override.at > TABLE_STATUS_OVERRIDE_TTL_MS) {
+        map.delete(t.id);
+        return t;
+      }
+      return {
+        ...t,
+        status: override.status as Table['status'],
+        is_reserved: override.status === 'RESERVED',
+      };
+    });
+  }, []);
+
+  /**
+   * A reservation code belongs to reserved tables and to no other.
+   * Reconcile against the same snapshot we are about to show, so a table
+   * reserved on another device still carries the right RES-#### id.
+   */
+  const syncReservations = useCallback((list: Table[]) => {
+    if (list.length === 0) return;
+    const live = new Set<string>();
+    for (const table of list) {
+      if (isReservedTable(table)) {
+        live.add(String(table.id));
+      }
+    }
+    syncReservationIds(live);
+  }, []);
+
   const fetchData = useCallback(async () => {
     if (!isLoggedIn) return;
     const generation = ++fetchGenerationRef.current;
@@ -370,7 +428,9 @@ export default function MainAppContainer() {
         setSections(sectionsRes.data);
       }
       if (tablesRes.success && tablesRes.data) {
-        setTables(tablesRes.data);
+        const next = withTableStatusOverrides(tablesRes.data);
+        syncReservations(next);
+        setTables(next);
       }
       if (activeOrdersRes.success && activeOrdersRes.data) {
         setActiveOrders(activeOrdersRes.data);
@@ -397,7 +457,7 @@ export default function MainAppContainer() {
         setRefreshing(false);
       }
     }
-  }, [isLoggedIn, refreshNotifications, forceSessionExpiry]);
+  }, [isLoggedIn, refreshNotifications, forceSessionExpiry, withTableStatusOverrides, syncReservations]);
 
   // ── Table status changes (reserve / free / mark bill) ──
   // Optimistic: flip the local snapshot immediately so the press paints on the
@@ -415,11 +475,13 @@ export default function MainAppContainer() {
   const refreshTables = useCallback(async () => {
     const res = await homeApi.getTables();
     if (res.success && res.data) {
-      setTables(res.data);
+      const next = withTableStatusOverrides(res.data);
+      syncReservations(next);
+      setTables(next);
     } else if (res.status === 401 || res.status === 403) {
       forceSessionExpiry('Your session is no longer valid. Please sign in again.');
     }
-  }, [forceSessionExpiry]);
+  }, [forceSessionExpiry, withTableStatusOverrides, syncReservations]);
 
   // Optimistic changes are confirmed by the PATCH response itself, so the
   // server's own `table.status` echo is a redundant refetch — skip it.
@@ -446,31 +508,69 @@ export default function MainAppContainer() {
     selfTableChangesRef.current.delete(`${tableId}:${String(status).toUpperCase()}`);
   }, []);
 
+  /**
+   * Reserve / free — the only two table states.
+   * The flip is applied locally first and pinned with an override, so a
+   * reserved table reads as Free the instant Free is pressed and STAYS free
+   * through the refresh loop — even against a server that does not persist
+   * table status. The PATCH is best-effort confirmation: only an expired
+   * session (401/403) rolls the change back.
+   */
   const changeTableStatus = useCallback(
     async (tableId: number, status: string): Promise<boolean> => {
+      const next = String(status).toUpperCase() === 'RESERVED' ? 'RESERVED' : 'AVAILABLE';
       const before = tablesRef.current.find((t) => t.id === tableId);
-      patchTableStatus(tableId, status);
+      // Booking mints the reservation code, anything else drops it. Snapshot
+      // first so an auth failure can put the original code back.
+      const priorReservationId = getReservationId(tableId);
+      if (next === 'RESERVED') assignReservationId(tableId);
+      else releaseReservationId(tableId);
+      setTableStatusOverride(tableId, next);
+      patchTableStatus(tableId, next);
       // Mark before awaiting: the server's echo can beat the PATCH response.
-      markSelfTableChange(tableId, status);
-      const res = await homeApi.updateTableStatus(tableId, status);
-      if (res.success && res.data) {
-        const server = res.data;
-        setTables((prev) => prev.map((t) => (t.id === tableId ? { ...t, ...server } : t)));
-        setSelectedTableForModal((prev) =>
-          prev && prev.id === tableId ? { ...prev, ...server } : prev,
-        );
-        return true;
-      }
-      clearSelfTableChange(tableId, status);
-      if (before) patchTableStatus(tableId, before.status);
+      markSelfTableChange(tableId, next);
+
+      const res = await homeApi.updateTableStatus(tableId, next);
       if (res.status === 401 || res.status === 403) {
+        clearTableStatusOverride(tableId);
+        clearSelfTableChange(tableId, next);
+        if (before) patchTableStatus(tableId, before.status);
+        releaseReservationId(tableId);
+        if (before && String(before.status).toUpperCase() === 'RESERVED') {
+          restoreReservationId(tableId, priorReservationId);
+        }
         forceSessionExpiry('Your session is no longer valid. Please sign in again.');
         return false;
       }
-      webAlert('Error', res.error || 'Failed to update table status');
-      return false;
+
+      if (res.success && res.data) {
+        const serverStatus = String(res.data.status ?? '').toUpperCase();
+        // Server confirmed the same status → its row wins and the override
+        // is no longer needed. A differing/missing status means it ignored
+        // the flip: keep the local one instead of resurrecting the old state.
+        if (serverStatus === next) {
+          clearTableStatusOverride(tableId);
+          const server = {
+            ...res.data,
+            status: serverStatus as Table['status'],
+            is_reserved: serverStatus === 'RESERVED',
+          };
+          setTables((prev) => prev.map((t) => (t.id === tableId ? { ...t, ...server } : t)));
+          setSelectedTableForModal((prev) =>
+            prev && prev.id === tableId ? { ...prev, ...server } : prev,
+          );
+        }
+      }
+      return true;
     },
-    [patchTableStatus, markSelfTableChange, clearSelfTableChange, forceSessionExpiry],
+    [
+      patchTableStatus,
+      markSelfTableChange,
+      clearSelfTableChange,
+      setTableStatusOverride,
+      clearTableStatusOverride,
+      forceSessionExpiry,
+    ],
   );
 
   // ── Live updates: WebSocket events trigger a throttled refetch (all platforms).
@@ -584,6 +684,10 @@ export default function MainAppContainer() {
     };
   }, [isLoggedIn, fetchData, refreshTables, refreshNotifications, forceSessionExpiry, consumeSelfTableChange, notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable]);
 
+  // Pushed screens (order-details: bill request, cashier checkout) ask for a
+  // resync right after their write — without waiting for the 30s heartbeat.
+  useEffect(() => subscribeMainRefresh(() => { fetchData(); }), [fetchData]);
+
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchData();
@@ -594,10 +698,15 @@ export default function MainAppContainer() {
   // its own login) and drops all state belonging to the previous server.
   const applyServerUrl = useCallback((url: string) => {
     fetchGenerationRef.current++;
+    // Web and native share the same rule: switching servers adopts that
+    // server's own saved session, so the same URL shows the same state.
     const session = loadSession(url);
     api.setToken(session?.token ?? null);
     setUser((session?.user as StaffUser | undefined) ?? null);
     setIsLoggedIn(Boolean(session));
+    if (session) {
+      fetchData();
+    }
     setActiveTab('dashboard');
     setSections([]);
     setTables([]);
@@ -609,9 +718,6 @@ export default function MainAppContainer() {
     removeStorageItemSync('smart_cafe_cleared_history');
     setHomeError('');
     setHomeLoading(true);
-    if (session) {
-      fetchData();
-    }
   }, [fetchData]);
 
   const handleLoginSuccess = (loggedUser: StaffUser) => {
@@ -664,40 +770,22 @@ export default function MainAppContainer() {
     }
   }, [activeOrders, router]);
 
-  // Start service server-side: creates the dining session + marks occupied.
-  // No optimistic local state — the server response is the truth.
-  const handleConfirmStartService = async () => {
-    if (!selectedTableForModal || startingService) return;
-    const tableId = selectedTableForModal.id;
-    setStartingService(true);
-    try {
-      const res = await homeApi.startTableSession(tableId);
-      if (res.success) {
-        setSelectedTableForModal(null);
-        await fetchData();
-        router.push(`/table/${tableId}` as any);
-      } else {
-        webAlert('Error', res.error || 'Failed to start service');
-      }
-    } catch (_err) {
-      webAlert('Error', 'Network error — could not start service');
-    } finally {
-      setStartingService(false);
-    }
+  // Reserve-only: "Take Order" never touches table status or sessions —
+  // it just opens the order pad (or order details when open orders exist).
+  const openOrderFlow = useCallback((tableId: number) => {
+    const hasOpenOrders = activeOrders.some((o) => o.tableId === tableId && isOpenOrder(o));
+    setSelectedTableForModal(null);
+    router.push((hasOpenOrders ? `/order-details/${tableId}` : `/table/${tableId}`) as any);
+  }, [activeOrders, router]);
+
+  const handleConfirmStartService = () => {
+    if (!selectedTableForModal) return;
+    openOrderFlow(selectedTableForModal.id);
   };
 
-  // RESERVED table popup → "Take Order". Jump straight to order details when the
-  // table already has an open order, otherwise open a dining session first.
   const handleReservedTakeOrder = () => {
     if (!selectedTableForModal) return;
-    const tableId = selectedTableForModal.id;
-    const hasOpenOrders = activeOrders.some((o) => o.tableId === tableId && isOpenOrder(o));
-    if (hasOpenOrders) {
-      setSelectedTableForModal(null);
-      router.push(`/order-details/${tableId}` as any);
-      return;
-    }
-    handleConfirmStartService();
+    openOrderFlow(selectedTableForModal.id);
   };
 
   const handleUpdateModalTableStatus = async (newStatus: string) => {
@@ -712,7 +800,8 @@ export default function MainAppContainer() {
     }
   };
 
-  // Dining time from the SERVER session (table.activeSession.openedAt)
+  // Elapsed time since the table's session opened (no session → '0 min').
+  // Kept for the order queues, which show age per table.
   const getElapsedDiningTime = useCallback((tableId: number): string => {
     const table = tables.find((t) => t.id === tableId);
     const openedAt = table?.activeSession ? new Date(table.activeSession.openedAt).getTime() : 0;
@@ -827,8 +916,7 @@ export default function MainAppContainer() {
               {[
                 { key: 'dashboard', icon: '📊', label: 'Dashboard', tab: 'dashboard' as const, roles: ['ADMIN', 'WAITER'] },
                 { key: 'home', icon: '🪑', label: 'My Tables', tab: 'home' as const, roles: ['ADMIN', 'WAITER'] },
-                { key: 'orders', icon: '📄', label: 'Order Details', tab: 'orders' as const, roles: ['ADMIN', 'WAITER', 'CHEF', 'CASHIER'] },
-                { key: 'kitchen', icon: '🍳', label: 'Kitchen Display', tab: 'kitchen' as const, roles: ['ADMIN', 'CHEF'] },
+                { key: 'orders', icon: '📄', label: 'Order Details', tab: 'orders' as const, roles: ['ADMIN', 'WAITER'] },
               ].filter(item => item.roles.includes(user?.role || '')).map((item) => (
                 <Hoverable
                   key={item.key}
@@ -935,7 +1023,7 @@ export default function MainAppContainer() {
                   hoverStyle={styles.darkDrawerItemHover}
                   onPress={() => {
                     closeDrawer();
-                    webAlert('About CafeOS', 'CafeOS Terminal v1.0.0\nRestaurant POS & Kitchen Display System Client.\n\nPowered by Leading Edge Software.', [{ text: 'OK' }]);
+                    webAlert('About CafeOS', 'CafeOS Terminal v1.0.0\nRestaurant POS Client.\n\nPowered by Leading Edge Software.', [{ text: 'OK' }]);
                   }}
                   hoverOpacity={1}
                 >
@@ -961,14 +1049,13 @@ export default function MainAppContainer() {
 
       <View style={styles.mainColumn}>
 
-      {/* ─── Render Selected Tab ───
-          Home/Orders/Menu render on demand, but KitchenScreen stays MOUNTED
-          (visibility toggle) so KDS progress state survives tab switches. */}
+      {/* ─── Render Selected Tab ─── */}
       {activeTab === 'dashboard' && (
         <Animated.View key="dashboard" entering={FadeIn.duration(250)} exiting={FadeOut.duration(150)} style={{ flex: 1 }}>
           <DashboardScreen
             user={user}
             tables={tables}
+            sections={sections}
             activeOrders={activeOrders}
             refreshing={refreshing}
             onRefresh={onRefresh}
@@ -1038,18 +1125,6 @@ export default function MainAppContainer() {
         </Animated.View>
       )}
 
-      {activeTab === 'kitchen' && (
-        <Animated.View key="kitchen" entering={FadeIn.duration(250)} exiting={FadeOut.duration(150)} style={{ flex: 1 }}>
-          <KitchenScreen
-            refreshing={refreshing}
-            onRefresh={onRefresh}
-            activeOrders={activeOrders}
-            onShowDrawer={openDrawer}
-            onOrderStatusChange={handleOrderStatusChange}
-          />
-        </Animated.View>
-      )}
-
       {activeTab === 'notifications' && (
         <Animated.View key="notifications" entering={FadeIn.duration(250)} exiting={FadeOut.duration(150)} style={{ flex: 1 }}>
           <NotificationScreen
@@ -1103,7 +1178,7 @@ export default function MainAppContainer() {
                     <MaterialCommunityIcons name="table-furniture" size={16} color={BRAND_ORANGE} />
                     <Text style={styles.metricLabel}>Active Tables</Text>
                     <Text style={styles.metricValue}>
-                      {tables.filter(t => t.status === 'OCCUPIED' || t.status === 'RESERVED').length}
+                      {tables.filter((t) => isReservedTable(t)).length}
                     </Text>
                   </View>
                   <View style={styles.metricDivider} />
@@ -1274,13 +1349,13 @@ export default function MainAppContainer() {
                   <MaterialIcons name="close" size={22} color={TEXT_MUTED} />
                 </TouchableOpacity>
               </View>
-              <Text style={styles.modalSubtitle}>Section: {sections.find(s => s.id === selectedTableForModal.sectionId)?.name || 'Main'}</Text>
+              <Text style={styles.modalSubtitle}>Section: {resolveTableSectionName(selectedTableForModal, sections)}</Text>
 
-              {selectedTableForModal.status === 'AVAILABLE' ? (
+              {!isReservedTable(selectedTableForModal) ? (
                 <View style={{ gap: 12 }}>
-                  <Hoverable style={[styles.btnPrimary, startingService && { opacity: 0.6 }]} onPress={handleConfirmStartService} disabled={startingService} hoverOpacity={0.8}>
+                  <Hoverable style={styles.btnPrimary} onPress={handleConfirmStartService} hoverOpacity={0.8}>
                     <MaterialIcons name="restaurant" size={20} color={BG_WHITE} />
-                    <Text style={styles.btnPrimaryText}>{startingService ? 'Taking…' : 'Take Order'}</Text>
+                    <Text style={styles.btnPrimaryText}>Take Order</Text>
                   </Hoverable>
                   <View style={[styles.divider, { marginVertical: 8 }]} />
                   <Text style={{ fontSize: 13, fontWeight: '700', color: TEXT_MUTED }}>Other Actions:</Text>
@@ -1290,7 +1365,7 @@ export default function MainAppContainer() {
                     </Hoverable>
                   </View>
                 </View>
-              ) : selectedTableForModal.status === 'RESERVED' || selectedTableForModal.is_reserved === true ? (
+              ) : (
                 <View style={{ gap: 12 }}>
                   <View style={styles.occupiedSummary}>
                     <View style={{ alignItems: 'center' }}>
@@ -1301,41 +1376,18 @@ export default function MainAppContainer() {
                       <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Seats</Text>
                       <Text style={{ fontSize: 14, fontWeight: '800', color: TEXT_DARK, marginTop: 2 }}>{selectedTableForModal.capacity} seats</Text>
                     </View>
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Reservation</Text>
+                      <Text style={{ fontSize: 14, fontWeight: '800', color: COLOR_ERROR, marginTop: 2 }}>{modalReservationId ?? '—'}</Text>
+                    </View>
                   </View>
-                  <Hoverable style={[styles.btnPrimary, startingService && { opacity: 0.6 }]} onPress={handleReservedTakeOrder} disabled={startingService} hoverOpacity={0.8}>
+                  <Hoverable style={styles.btnPrimary} onPress={handleReservedTakeOrder} hoverOpacity={0.8}>
                     <MaterialIcons name="restaurant" size={20} color={BG_WHITE} />
-                    <Text style={styles.btnPrimaryText}>{startingService ? 'Taking…' : 'Take Order'}</Text>
+                    <Text style={styles.btnPrimaryText}>Take Order</Text>
                   </Hoverable>
                   <Hoverable style={[styles.btnPrimary, { backgroundColor: COLOR_SUCCESS }]} onPress={() => handleUpdateModalTableStatus('AVAILABLE')} hoverOpacity={0.8}>
                     <MaterialIcons name="lock-open" size={20} color={BG_WHITE} />
                     <Text style={styles.btnPrimaryText}>Free Table</Text>
-                  </Hoverable>
-                </View>
-              ) : (
-                <View style={{ gap: 12 }}>
-                  <View style={styles.occupiedSummary}>
-                    <View style={{ alignItems: 'center' }}>
-                      <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Status</Text>
-                      <Text style={{ fontSize: 14, fontWeight: '800', color: BRAND_ORANGE, marginTop: 2 }}>Occupied</Text>
-                    </View>
-                    <View style={{ alignItems: 'center' }}>
-                      <Text style={{ fontSize: 11, color: TEXT_MUTED, fontWeight: '600' }}>Time</Text>
-                      <Text style={{ fontSize: 14, fontWeight: '800', color: TEXT_DARK, marginTop: 2 }}>
-                        {getElapsedDiningTime(selectedTableForModal.id)}
-                      </Text>
-                    </View>
-                  </View>
-                  <Hoverable style={styles.btnPrimary} onPress={() => { const id = selectedTableForModal.id; setSelectedTableForModal(null); router.push(`/table/${id}` as any); }} hoverOpacity={0.8}>
-                    <MaterialIcons name="menu-book" size={20} color={BG_WHITE} />
-                    <Text style={styles.btnPrimaryText}>Open Order Pad</Text>
-                  </Hoverable>
-                  <Hoverable style={[styles.btnPrimary, { backgroundColor: COLOR_WARNING }]} onPress={() => handleUpdateModalTableStatus('PENDING_BILL')} hoverOpacity={0.8}>
-                    <MaterialIcons name="receipt-long" size={20} color={BG_WHITE} />
-                    <Text style={styles.btnPrimaryText}>Mark Pending Bill</Text>
-                  </Hoverable>
-                  <Hoverable style={[styles.btnPrimary, { backgroundColor: COLOR_SUCCESS }]} onPress={() => handleUpdateModalTableStatus('AVAILABLE')} hoverOpacity={0.8}>
-                    <MaterialIcons name="cleaning-services" size={20} color={BG_WHITE} />
-                    <Text style={styles.btnPrimaryText}>Free & Clear Table</Text>
                   </Hoverable>
                 </View>
               )}
@@ -1388,12 +1440,6 @@ export default function MainAppContainer() {
               )}
             </View>
             <Text style={[styles.tabBtnText, activeTab === 'notifications' && styles.tabBtnTextActive]}>Alerts</Text>
-          </Hoverable>
-        )}
-        {visibleTabs.includes('kitchen') && (
-          <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('kitchen'); }} hoverOpacity={0.7}>
-            <MaterialCommunityIcons name="chef-hat" size={activeTab === 'kitchen' ? 28 : 24} color={activeTab === 'kitchen' ? BRAND_PRIMARY : TEXT_MUTED} />
-            <Text style={[styles.tabBtnText, activeTab === 'kitchen' && styles.tabBtnTextActive]}>Kitchen</Text>
           </Hoverable>
         )}
         <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('profile'); }} hoverOpacity={0.7}>

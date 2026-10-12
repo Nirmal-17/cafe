@@ -43,7 +43,11 @@ example
 /ios
 /android
 
-# backend
+# backend — the API is NOT kept inside this checkout, it runs from its own
+# folder and is only referenced (see scripts/dev.js resolveBackendDir).
+# Guard so a copied backend/ (with .env secrets + dev.db) can never be
+# committed here by accident.
+/backend/
 backend/dist/
 backend/prisma/*.db
 backend/prisma/*.db-journal

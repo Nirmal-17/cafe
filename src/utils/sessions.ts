@@ -8,7 +8,7 @@ export interface SessionUser {
   id: number;
   name: string;
   email: string;
-  role: 'WAITER' | 'CHEF' | 'CASHIER' | 'ADMIN';
+  role: 'WAITER' | 'ADMIN';
   createdAt?: string;
 }
 

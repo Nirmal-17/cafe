@@ -22,13 +22,39 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const RESET = '\x1b[0m';
 
+/**
+ * Where the API lives. No backend/ folder is kept inside this checkout —
+ * the API runs from its own folder and is only *referenced* from here:
+ *   1. backend/package.json next to this script (a linked checkout), else
+ *   2. CAFEOS_BACKEND_DIR when set, else
+ *   3. the sibling checkout beside this folder (../cafe/.../backend).
+ * Returns null when no API checkout is found — the Expo task still runs.
+ */
+function resolveBackendDir() {
+  const candidates = [
+    path.join(ROOT, 'backend'),
+    process.env.CAFEOS_BACKEND_DIR,
+    path.resolve(ROOT, '..', 'cafe', 'cafe-os-mobile-app-react-native', 'backend'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    } catch {
+      // Unreadable candidate — try the next one.
+    }
+  }
+  return null;
+}
+
+const BACKEND_DIR = resolveBackendDir();
+
 const TASKS = [
   {
     name: 'api',
     color: '\x1b[36m',
     port: 3000,
     cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-    args: ['run', 'dev', '--prefix', path.join(ROOT, 'backend')],
+    args: ['run', 'dev', '--prefix', BACKEND_DIR || path.join(ROOT, 'backend')],
   },
   {
     name: 'expo',
@@ -99,10 +125,14 @@ function shutdown(code) {
 }
 
 function spawnTask(task) {
+  // Windows: .cmd shims (npm.cmd / npx.cmd) cannot be spawned directly —
+  // newer Node fails with `spawn EINVAL`. A shell is required to launch them.
+  // (Args here are fixed task names + local paths, never user input.)
   const child = spawn(task.cmd, task.args, {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, FORCE_COLOR: process.env.FORCE_COLOR || '1', EXPO_NO_TELEMETRY: '1' },
+    shell: process.platform === 'win32',
+    env: { ...process.env, FORCE_COLOR: process.env.FORCE_COLOR || '1', EXPO_NO_TELEMETRY: '1', NODE_NO_WARNINGS: '1' },
   });
 
   children.set(task.name, child);
@@ -134,10 +164,13 @@ function spawnTask(task) {
 async function main() {
   const startedAt = Date.now();
 
-  // This checkout can be frontend-only (the API living in a sibling repo or
-  // hosted). Without this guard the `api` task runs `npm --prefix backend`
-  // against a folder that isn't there, exits ENOENT and takes Expo down.
-  const hasBackend = fs.existsSync(path.join(ROOT, 'backend', 'package.json'));
+  // This checkout is frontend-only (the API lives in its own folder and is
+  // only referenced — see resolveBackendDir). Without this guard the `api`
+  // task runs `npm --prefix` against a folder that isn't there, exits and
+  // takes Expo down.
+  const hasBackend = BACKEND_DIR !== null;
+  const onlyApi = process.argv.includes('--api-only');
+  const onlyApp = process.argv.includes('--app-only');
 
   // Server sign-in will hit — configured in .env (EXPO_PUBLIC_API_URL).
   let apiUrl = 'https://cafeos.leadingedge.com.np';
@@ -150,13 +183,15 @@ async function main() {
 
   process.stdout.write(
     hasBackend
-      ? 'CafeOS dev — API :3000 + Expo Metro :8081 (Ctrl+C stops both)\n'
+      ? `CafeOS dev — API :3000 + Expo Metro :8081 (Ctrl+C stops both)\nAPI dir: ${BACKEND_DIR}\n`
       : `CafeOS dev — Expo Metro :8081 (Ctrl+C stops it)   API: ${apiUrl}\n`
   );
 
   const tasks = TASKS.filter((task) => {
+    if (onlyApi && task.name !== 'api') return false;
+    if (onlyApp && task.name !== 'expo') return false;
     if (task.name === 'api' && !hasBackend) {
-      writeLine(task, 'no backend/ folder in this checkout — skipping the API task', 'stderr');
+      writeLine(task, 'no API checkout found (checked backend/, CAFEOS_BACKEND_DIR, sibling folder) — skipping the API task', 'stderr');
       return false;
     }
     return true;
@@ -170,17 +205,17 @@ async function main() {
     spawnTask(task);
   }
 
-  // No local API: say where sign-in goes instead of leaving it to a generic
+  // No API checkout: say where sign-in goes instead of leaving it to a generic
   // "server unreachable" on the login form.
   if (!hasBackend) {
-    process.stdout.write(`Note: no local API in this checkout — sign-in goes to ${apiUrl}\n`);
+    process.stdout.write(`Note: no API checkout found — sign-in goes to ${apiUrl}\n`);
   }
 
   if (children.size === 0) {
     process.stdout.write(
       hasBackend
         ? 'Both servers were already running — nothing new to start.\n'
-        : 'Expo Metro already running — nothing new to start (API task was skipped, no backend/ folder).\n'
+        : 'Expo Metro already running — nothing new to start (API task was skipped, no API checkout found).\n'
     );
     return;
   }

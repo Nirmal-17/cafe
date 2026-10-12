@@ -10,10 +10,13 @@ export const COLORS = {
   yellow: '#FFD600',
   green: '#16A34A',
   red: '#D32F2F',
-  purple: '#7C3AED',
+  purple: '#4C1D95',
+  darkPurple: '#4C1D95',
   teal: '#0D9488',
+  brown: '#A16207',
   amber: '#F59E0B',
   cyan: '#06B6D4',
+  lime: '#84CC16',
   pink: '#EC4899',
 
   background: '#F0F4FF',
@@ -34,11 +37,8 @@ export const STATUS_COLORS: Record<string, string> = {
 };
 
 export const TABLE_STATUS_COLORS: Record<string, string> = {
-  OCCUPIED: '#7C3AED',
-  PENDING_BILL: '#F59E0B',
   AVAILABLE: '#16A34A',
-  RESERVED: '#7C3AED',
-  CLEANING: '#6B7280',
+  RESERVED: '#4C1D95',
 };
 
 export function formatMoney(value: number): string {

@@ -4,53 +4,49 @@ import React, { useMemo, useState, useRef } from 'react';
 import { Text, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
-import { Order, Table } from '@/services/api';
+import { Order, Section, Table, isReservedTable } from '@/services/api';
+import { groupTablesBySection } from '@/utils/tableSections';
 import { useResponsive, getResponsiveValue } from '@/utils/responsive';
 import { isOpenOrder } from '@/utils/openValue';
+import { getReservationId, useReservationsRevision } from '@/utils/reservations';
 import { COLORS, SectionCard, TABLE_STATUS_COLORS } from './shared';
+import { filterTablesByServiceTypeWithFallback, getServiceTypeLabel } from '@/utils/diningArea';
 import { Popover } from '@/components/Popover';
 import { useRouter } from 'expo-router';
-import { homeApi } from '@/services/homeApi';
-import { webAlert } from '@/utils/webAlert';
 
 interface FloorPlanGridProps {
   tables: Table[];
+  sections?: Section[];
   activeOrders: Order[];
-  isWaiter: boolean;
-  userId?: number;
-  getElapsed: (tableId: number) => string;
   onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
+  serviceType?: 'dine-in' | 'delivery' | 'takeaway' | 'all';
 }
 
 const LEGEND: { status: string; label: string }[] = [
-  { status: 'OCCUPIED', label: 'Occupied' },
-  { status: 'PENDING_BILL', label: 'Bill' },
   { status: 'AVAILABLE', label: 'Free' },
   { status: 'RESERVED', label: 'Reserved' },
-  { status: 'CLEANING', label: 'Cleaning' },
 ];
 
-function statusPriority(status: string): number {
-  if (status === 'OCCUPIED' || status === 'PENDING_BILL') return 1;
-  if (status === 'RESERVED') return 2;
-  if (status === 'CLEANING') return 3;
-  return 4;
+function statusPriority(table: Table): number {
+  return isReservedTable(table) ? 1 : 2;
 }
 
 export function FloorPlanGrid({
   tables,
+  sections,
   activeOrders,
-  isWaiter,
-  userId,
-  getElapsed,
   onChangeTableStatus,
   onSeeAll,
+  serviceType,
 }: FloorPlanGridProps) {
   const { breakpoint } = useResponsive();
   const [popoverTable, setPopoverTable] = useState<Table | null>(null);
   const [popoverAnchorRef, setPopoverAnchorRef] = useState<React.RefObject<View | null> | null>(null);
   const router = useRouter();
+
+  // Re-render the tiles when a RES-#### code is minted or dropped.
+  useReservationsRevision();
 
   const tileRefs = useRef<Map<number, React.RefObject<View | null>>>(new Map());
 
@@ -87,24 +83,13 @@ export function FloorPlanGrid({
     return map;
   }, [activeOrders]);
 
-  const handleTakeOrder = async (table: Table) => {
+  // Reserve-only: taking an order never changes table status.
+  const handleTakeOrder = (table: Table) => {
     const orders = ordersByTable.get(table.id) ?? [];
-    if (orders.some(isOpenOrder)) {
-      closePopover();
-      router.push(`/order-details/${table.id}` as any);
-      return;
-    }
     closePopover();
-    try {
-      const res = await homeApi.startTableSession(table.id);
-      if (res.success) {
-        router.push(`/table/${table.id}` as any);
-      } else {
-        webAlert('Error', res.error || 'Failed to start service');
-      }
-    } catch {
-      webAlert('Error', 'Network error — could not start service');
-    }
+    router.push(
+      (orders.some(isOpenOrder) ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
+    );
   };
 
   const handleFreeTable = async (table: Table) => {
@@ -119,40 +104,45 @@ export function FloorPlanGrid({
     await onChangeTableStatus(table.id, 'RESERVED');
   };
 
-  // Reserved / busy table tap → jump straight to that table's order screen
-  const openTableOrder = (table: Table) => {
-    const orders = ordersByTable.get(table.id) ?? [];
-    const hasOpenOrders = orders.some(isOpenOrder);
-    router.push(
-      (hasOpenOrders ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
-    );
-  };
-
+  // Reserve-only: every table is visible to everyone (no session scoping).
+  // Same outer-level fallback as the dashboard: Delivery/Takeaway show the
+  // shared tables only when no dedicated Del*/Take* tables exist at all.
   const visibleTables = useMemo(() => {
-    const scoped = tables.filter((table) => {
-      if (!isWaiter) return true;
-      const status = String(table.status).toUpperCase();
-      if (status === 'AVAILABLE' || status === 'RESERVED') return true;
-      return (
-        table.activeSession?.waiterId != null &&
-        String(table.activeSession.waiterId) === String(userId)
-      );
+    const scoped =
+      serviceType && serviceType !== 'all'
+        ? filterTablesByServiceTypeWithFallback(tables, serviceType)
+        : tables;
+    return [...scoped].sort((a, b) => {
+      const diff = statusPriority(a) - statusPriority(b);
+      if (diff !== 0) return diff;
+      return String(a.tableNumber).localeCompare(String(b.tableNumber), undefined, {
+        numeric: true,
+        sensitivity: 'base',
+      });
     });
-    return [...scoped].sort((a, b) => statusPriority(a.status) - statusPriority(b.status));
-  }, [tables, isWaiter, userId]);
+  }, [tables, serviceType]);
+
+  // Group by section (Indoor / Outdoor / Roof / Cabin / Hall / Garden /
+  // Pool / Room) so each dine-in area gets its own heading + row, matching
+  // the Tables card. Names resolve through the sections list — the hosted
+  // feed carries no nested section object. Delivery / Takeaway keep a single
+  // group under their own heading (their tables share one service meaning,
+  // not an area); Dine In groups by area like the unfiltered view.
+  const groupedTables = useMemo<[string, Table[]][]>(
+    () => {
+      if (serviceType && serviceType !== 'all' && serviceType !== 'dine-in' && visibleTables.length > 0) {
+        return [[getServiceTypeLabel(serviceType), visibleTables]];
+      }
+      return groupTablesBySection(visibleTables, sections);
+    },
+    [visibleTables, sections, serviceType],
+  );
 
   const counts = useMemo(() => {
-    const occupied = visibleTables.filter(
-      (t) => t.status === 'OCCUPIED' || t.status === 'PENDING_BILL',
-    ).length;
-    const free = visibleTables.filter((t) => t.status === 'AVAILABLE').length;
-    const mine = visibleTables.filter(
-      (t) =>
-        t.activeSession?.waiterId != null &&
-        String(t.activeSession.waiterId) === String(userId),
-    ).length;
-    return { occupied, free, mine };
-  }, [visibleTables, userId]);
+    const reserved = visibleTables.filter((t) => isReservedTable(t)).length;
+    const free = visibleTables.length - reserved;
+    return { reserved, free };
+  }, [visibleTables]);
 
   const cellWidth = getResponsiveValue(
     { xs: '48.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' },
@@ -172,44 +162,30 @@ export function FloorPlanGrid({
       >
         <View style={styles.summaryRow}>
           <View style={styles.summaryChip}>
-            <View style={[styles.summaryDot, { backgroundColor: TABLE_STATUS_COLORS.OCCUPIED }]} />
-            <Text style={styles.summaryText}>{counts.occupied} occupied</Text>
+            <View style={[styles.summaryDot, { backgroundColor: TABLE_STATUS_COLORS.RESERVED }]} />
+            <Text style={styles.summaryText}>{counts.reserved} reserved</Text>
           </View>
           <View style={styles.summaryChip}>
             <View style={[styles.summaryDot, { backgroundColor: TABLE_STATUS_COLORS.AVAILABLE }]} />
             <Text style={styles.summaryText}>{counts.free} free</Text>
           </View>
-          {isWaiter && (
-            <View style={styles.summaryChip}>
-              <View style={[styles.summaryDot, { backgroundColor: COLORS.primary }]} />
-              <Text style={styles.summaryText}>{counts.mine} mine</Text>
-            </View>
-          )}
         </View>
 
-        <View style={styles.grid}>
-          {visibleTables.map((table) => {
-            const reserved =
-              table.status === 'RESERVED' || table.is_reserved === true;
-            const status =
-              reserved && table.status === 'AVAILABLE' ? 'RESERVED' : table.status;
+        {groupedTables.map(([sectionName, sectionTables]) => (
+          <View key={sectionName} style={styles.sectionGroup}>
+            <Text style={styles.sectionHeading}>{sectionName}</Text>
+            <View style={styles.grid}>
+              {sectionTables.map((table) => {
+            // Reserve-only: Free (white) or Reserved (solid dark purple).
+            const reservedTile = isReservedTable(table);
+            const status = reservedTile ? 'RESERVED' : 'AVAILABLE';
             const color = TABLE_STATUS_COLORS[status] || COLORS.primary;
-            const isMine =
-              table.activeSession?.waiterId != null &&
-              String(table.activeSession.waiterId) === String(userId);
-            const busy = table.status === 'OCCUPIED' || table.status === 'PENDING_BILL';
-            const purpleTile = reserved || table.status === 'OCCUPIED';
-            const purple = TABLE_STATUS_COLORS.RESERVED;
-            const tileBackground = purpleTile
-              ? purple
-              : status === 'AVAILABLE'
-                ? COLORS.white
-                : color + '12';
-            const tileBorder = purpleTile ? purple : color;
-            const contentColor = purpleTile ? COLORS.white : COLORS.text;
-            const metaColor = purpleTile ? '#EDE9FE' : COLORS.muted;
-
-            const isAvailable = table.status === 'AVAILABLE';
+            const darkPurple = TABLE_STATUS_COLORS.RESERVED;
+            const tileBackground = reservedTile ? darkPurple : '#FFFFFF';
+            const tileBorder = reservedTile ? darkPurple : '#E5E7EB';
+            const contentColor = reservedTile ? COLORS.white : COLORS.text;
+            const metaColor = reservedTile ? '#EDE9FE' : COLORS.muted;
+            const reservationId = reservedTile ? getReservationId(table.id) : null;
 
             return (
               <View key={table.id} style={[styles.cell, { width: cellWidth }]}>
@@ -219,11 +195,7 @@ export function FloorPlanGrid({
                     styles.tile,
                     { backgroundColor: tileBackground, borderColor: tileBorder },
                   ]}
-                  onPress={() => {
-                    if (isAvailable || reserved) handleTablePress(table);
-                    else if (String(table.status).toUpperCase() !== 'CLEANING')
-                      openTableOrder(table);
-                  }}
+                  onPress={() => handleTablePress(table)}
                   hoverOpacity={0.8}
                 >
                   <View style={styles.tileTop}>
@@ -236,67 +208,42 @@ export function FloorPlanGrid({
                     <View
                       style={[
                         styles.statusDot,
-                        { backgroundColor: purpleTile ? COLORS.white : color },
+                        { backgroundColor: reservedTile ? COLORS.white : color },
                       ]}
                     />
                   </View>
 
-                  {busy ? (
-                    <View style={styles.tileMeta}>
-                      <MaterialCommunityIcons
-                        name="clock-outline"
-                        size={10}
-                        color={purpleTile ? '#EDE9FE' : COLORS.muted}
-                      />
-                      <Text style={[styles.tileMetaText, { color: metaColor }]}>
-                        {getElapsed(table.id)}
-                      </Text>
-                    </View>
-                  ) : (
-                    <View style={styles.tileMeta}>
-                      <MaterialCommunityIcons
-                        name="seat"
-                        size={10}
-                        color={purpleTile ? '#EDE9FE' : COLORS.muted}
-                      />
-                      <Text style={[styles.tileMetaText, { color: metaColor }]}>
-                        {table.capacity}
-                      </Text>
-                      <Text
-                        style={[
-                          styles.tileMetaText,
-                          { color: purpleTile ? COLORS.white : color },
-                        ]}
-                      >
-                        {status === 'AVAILABLE'
-                          ? 'Free'
-                          : status === 'RESERVED'
-                            ? 'Reserved'
-                            : 'Clean'}
-                      </Text>
-                    </View>
-                  )}
+                  <View style={styles.tileMeta}>
+                    <MaterialCommunityIcons
+                      name="seat"
+                      size={10}
+                      color={reservedTile ? '#EDE9FE' : COLORS.muted}
+                    />
+                    <Text style={[styles.tileMetaText, { color: metaColor }]}>
+                      {table.capacity}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.tileMetaText,
+                        { color: reservedTile ? COLORS.white : color },
+                      ]}
+                    >
+                      {reservedTile ? 'Reserved' : 'Free'}
+                    </Text>
+                  </View>
 
                   <View style={styles.tileTags}>
-                    {table.status === 'PENDING_BILL' && (
-                      <View style={[styles.tag, { backgroundColor: TABLE_STATUS_COLORS.PENDING_BILL }]}>
-                        <Text style={styles.tagText}>BILL</Text>
-                      </View>
-                    )}
-                    {isMine && (
+                    {reservationId && (
                       <View
                         style={[
                           styles.tag,
-                          purpleTile ? { backgroundColor: COLORS.white } : styles.tagMine,
+                          { backgroundColor: reservedTile ? COLORS.white : COLORS.primary },
                         ]}
                       >
                         <Text
-                          style={[
-                            styles.tagText,
-                            purpleTile && { color: purple },
-                          ]}
+                          style={[styles.tagText, reservedTile && { color: darkPurple }]}
                         >
-                          ME
+                          {reservationId}
                         </Text>
                       </View>
                     )}
@@ -305,7 +252,9 @@ export function FloorPlanGrid({
               </View>
             );
           })}
-        </View>
+            </View>
+          </View>
+        ))}
 
         <View style={styles.legend}>
           {LEGEND.map((item) => (
@@ -323,7 +272,7 @@ export function FloorPlanGrid({
           anchorRef={popoverAnchorRef}
           onClose={closePopover}
           items={
-            popoverTable.status === 'RESERVED' || popoverTable.is_reserved === true
+            isReservedTable(popoverTable)
               ? [
                   {
                     label: 'Take Order',
@@ -346,7 +295,7 @@ export function FloorPlanGrid({
                     label: 'Reserve Table',
                     icon: 'bookmark-outline',
                     onPress: () => handleReserve(popoverTable),
-                    disabled: String(popoverTable.status).toUpperCase() !== 'AVAILABLE',
+                    disabled: isReservedTable(popoverTable),
                   },
                 ]
           }
@@ -383,6 +332,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     marginHorizontal: -4,
+  },
+  sectionGroup: {
+    marginBottom: 12,
+  },
+  sectionHeading: {
+    fontSize: 19,
+    fontWeight: '800',
+    color: '#0E5A6B',
+    marginBottom: 8,
   },
   cell: {
     paddingHorizontal: 4,

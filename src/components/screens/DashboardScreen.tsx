@@ -11,19 +11,28 @@ import {
 } from 'react-native';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
-import { api, DashboardData, Order, StaffUser, Table } from '@/services/api';
+import { api, Order, Section, StaffUser, Table, isReservedTable } from '@/services/api';
+import {
+  DiningArea,
+  filterTablesByDiningArea,
+  getTablesByDiningArea,
+  isIndoor,
+  isOutdoor,
+  getDiningAreaLabel,
+  filterTablesByServiceTypeWithFallback,
+} from '@/utils/diningArea';
 import { COLORS, SectionCard, formatMoney } from '@/components/dashboard/shared';
 import { DashboardKpi, KpiGrid } from '@/components/dashboard/KpiGrid';
-import { ShiftStats, TodayServiceCard } from '@/components/dashboard/TodayServiceCard';
 import { OrderActionList } from '@/components/dashboard/ActionQueue';
 import { FloorPlanGrid } from '@/components/dashboard/FloorPlanGrid';
-import { InsightsCard } from '@/components/dashboard/InsightsCard';
 import { TableTabsCard } from '@/components/dashboard/TableTabsCard';
 import { isOpenOrder } from '@/utils/openValue';
+import { filterWaiterDashboardTables } from '@/utils/waiterTables';
 
 interface DashboardScreenProps {
   user: StaffUser | null;
   tables: Table[];
+  sections?: Section[];
   activeOrders: Order[];
   refreshing: boolean;
   onRefresh: () => void;
@@ -38,27 +47,36 @@ interface DashboardScreenProps {
   onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   unreadCount?: number;
   onShowNotifications?: () => void;
+  onSectionChange?: (sectionName: string) => void;
 }
 
 const EXTRAS_MIN_INTERVAL_MS = 45000;
 
+// Section filter blocks: golden-orange fill when active/hovered,
+// white block with dark-teal text when idle.
+const SECTION_ACTIVE_FILL = '#C07F00';
+const SECTION_INACTIVE_TEXT = '#0E5A6B';
+const SECTION_INACTIVE_BORDER = '#D9E4E7';
+
 export function DashboardScreen({
   user,
   tables,
+  sections,
   activeOrders,
   refreshing,
   onRefresh,
   onNavigateToTab,
   onNavigateProfile,
   getElapsedDiningTime,
-  isWaiter = false,
   onShowDrawer,
+  isWaiter,
   onTablePress,
   onOrderPress,
   onOrderStatusChange,
   onChangeTableStatus,
   unreadCount = 0,
   onShowNotifications,
+  onSectionChange,
 }: DashboardScreenProps) {
   // ── Live clock (greeting + header time) ──
   const [clock, setClock] = useState<Date>(() => new Date());
@@ -82,11 +100,8 @@ export function DashboardScreen({
     return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
   }, [clock]);
 
-  // ── Extra data: analytics + today's shift stats (own cadence, deduped) ──
-  const [analytics, setAnalytics] = useState<DashboardData | null>(null);
-  const [shiftStats, setShiftStats] = useState<ShiftStats | null>(null);
+  // ── Extra data: today's paid total for the KPI (own cadence, deduped) ──
   const [todayPaidTotal, setTodayPaidTotal] = useState(0);
-  const [extrasLoading, setExtrasLoading] = useState(true);
   const lastExtrasAtRef = useRef(0);
 
   const loadExtras = useCallback(
@@ -94,50 +109,28 @@ export function DashboardScreen({
       const now = Date.now();
       if (!force && now - lastExtrasAtRef.current < EXTRAS_MIN_INTERVAL_MS) return;
       lastExtrasAtRef.current = now;
-      setExtrasLoading(true);
-      try {
-        const dayStart = new Date();
-        dayStart.setHours(0, 0, 0, 0);
-        const dayEnd = new Date();
-        dayEnd.setHours(23, 59, 59, 999);
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date();
+      dayEnd.setHours(23, 59, 59, 999);
 
-        const [analyticsRes, ordersRes] = await Promise.all([
-          isWaiter
-            ? Promise.resolve({ success: false as const })
-            : api.getDashboardAnalytics().catch(() => ({ success: false as const })),
-          api
-            .getOrders({
-              page: 1,
-              limit: 500,
-              dateFrom: dayStart.toISOString(),
-              dateTo: dayEnd.toISOString(),
-            })
-            .catch(() => ({ success: false as const })),
-        ]);
+      const ordersRes = await api
+        .getOrders({
+          page: 1,
+          limit: 500,
+          dateFrom: dayStart.toISOString(),
+          dateTo: dayEnd.toISOString(),
+        })
+        .catch(() => ({ success: false as const }));
 
-        if (analyticsRes.success && analyticsRes.data) {
-          setAnalytics(analyticsRes.data);
-        }
-        if (ordersRes.success && ordersRes.data) {
-          const orders = ordersRes.data.orders;
-          const paid = orders.filter((o) => o.paymentStatus === 'PAID');
-          const cancelled = orders.filter((o) => o.status === 'CANCELLED');
-          const revenue = paid.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
-          setTodayPaidTotal(revenue);
-          if (!isWaiter) {
-            setShiftStats({
-              orders: Math.max(0, ordersRes.data.total - cancelled.length),
-              bills: paid.length,
-              revenue,
-              avgTicket: paid.length > 0 ? Math.round(revenue / paid.length) : 0,
-            });
-          }
-        }
-      } finally {
-        setExtrasLoading(false);
+      if (ordersRes.success && ordersRes.data) {
+        const orders = ordersRes.data.orders;
+        const paid = orders.filter((o) => o.paymentStatus === 'PAID');
+        const revenue = paid.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+        setTodayPaidTotal(revenue);
       }
     },
-    [isWaiter],
+    [],
   );
 
   useEffect(() => {
@@ -158,13 +151,21 @@ export function DashboardScreen({
     loadExtras(false);
   }, [activeOrders, loadExtras]);
 
+  // ── Waiter dashboard shows ONLY the venue allowlist (IN 1-5, R 1-3,
+  // C 1, Test 2 / Test Hall, G 1-4, P 1-2, Deluxe Room 1-5, Outdoor 01-06).
+  // Admin dashboard + My Tables keep the full server list.
+  const displayTables = useMemo(
+    () => (isWaiter ? filterWaiterDashboardTables(tables) : tables),
+    [tables, isWaiter],
+  );
+
   // ── System-wide derivations (every table / order, not just the current user's) ──
+  // Reserve-only: tables are either Reserved or Free.
   const tableStats = useMemo(() => {
-    const occupied = tables.filter((t) => t.status === 'OCCUPIED').length;
-    const pendingBill = tables.filter((t) => t.status === 'PENDING_BILL').length;
-    const available = tables.filter((t) => t.status === 'AVAILABLE').length;
-    return { occupied, pendingBill, available, busyTableCount: occupied + pendingBill };
-  }, [tables]);
+    const reserved = displayTables.filter((t) => isReservedTable(t)).length;
+    const available = displayTables.length - reserved;
+    return { reserved, available };
+  }, [displayTables]);
 
   const activeOrderCount = activeOrders.length;
 
@@ -195,6 +196,35 @@ export function DashboardScreen({
   // ── Handlers ──
   const [servingIds, setServingIds] = useState<number[]>([]);
 
+  const [activeSection, setActiveSection] = useState<'dine-in' | 'delivery' | 'takeaway'>('dine-in');
+  const [hoveredSection, setHoveredSection] = useState<string | null>(null);
+
+  const sectionFilterOptions: { key: 'dine-in' | 'delivery' | 'takeaway'; label: string; icon: string }[] = [
+    { key: 'dine-in', label: 'Dine In', icon: 'silverware-fork-knife' },
+    { key: 'delivery', label: 'Delivery', icon: 'scooter' },
+    { key: 'takeaway', label: 'Takeaway', icon: 'food-takeout-box' },
+  ];
+
+  const handleSectionChange = useCallback(
+    (key: 'dine-in' | 'delivery' | 'takeaway') => {
+      setActiveSection(key);
+      onSectionChange?.(key);
+    },
+    [onSectionChange],
+  );
+
+  const filteredTables = useMemo(() => {
+    // Outer-level helper: Delivery/Takeaway fall back to the shared tables
+    // only when no dedicated Del*/Take* tables exist at all.
+    return filterTablesByServiceTypeWithFallback(displayTables, activeSection);
+  }, [displayTables, activeSection]);
+
+  const sectionLabels = useMemo(() => {
+    const labels = new Set(displayTables.map((t) => t.section?.name).filter(Boolean));
+    return Array.from(labels).sort();
+  }, [displayTables]);
+
+  // ── Handlers ──
   const handleServe = useCallback(
     async (order: Order) => {
       if (!onOrderStatusChange) return;
@@ -232,8 +262,8 @@ export function DashboardScreen({
     {
       icon: 'table-furniture',
       color: COLORS.orange,
-      value: String(tableStats.busyTableCount),
-      label: 'Tables In Use',
+      value: String(tableStats.reserved),
+      label: 'Tables Reserved',
       onPress: () => onNavigateToTab('home'),
     },
     {
@@ -313,20 +343,61 @@ export function DashboardScreen({
         {/* KPI SUMMARY */}
         <KpiGrid kpis={kpis} />
 
+        {/* TABLE PICKER PROMPT */}
+        <View style={styles.tablePromptWrap}>
+          <Text style={styles.tablePromptText}>Please Choose Table for Ordering</Text>
+        </View>
+
+        {/* SECTION FILTER BUTTONS */}
+        <View style={styles.sectionFilterBar}>
+          {sectionFilterOptions.map((option) => {
+            const isActive = activeSection === option.key;
+            const isHovered = hoveredSection === option.key;
+            const highlighted = isActive || isHovered;
+            return (
+              <Hoverable
+                key={option.key}
+                style={[
+                  styles.sectionFilterBtn,
+                  highlighted && styles.sectionFilterBtnActive,
+                ]}
+                hoverStyle={styles.sectionFilterBtnActive}
+                onPress={() => handleSectionChange(option.key)}
+                onHoverIn={() => setHoveredSection(option.key)}
+                onHoverOut={() => setHoveredSection((cur) => (cur === option.key ? null : cur))}
+                hoverOpacity={1}
+                accessibilityRole="button"
+                accessibilityState={{ selected: isActive }}
+              >
+                <MaterialCommunityIcons
+                  name={option.icon as any}
+                  size={18}
+                  color={highlighted ? COLORS.white : SECTION_INACTIVE_TEXT}
+                />
+                <Text
+                  style={[
+                    styles.sectionFilterBtnText,
+                    highlighted && styles.sectionFilterBtnTextActive,
+                  ]}
+                >
+                  {option.label}
+                </Text>
+              </Hoverable>
+            );
+          })}
+        </View>
+
         {/* TABLES — All / Free / Reserved tabs with table + order details */}
         <TableTabsCard
-          tables={tables}
+          tables={filteredTables}
+          sections={sections}
           activeOrders={activeOrders}
           getElapsed={getElapsedDiningTime}
           onOrderPress={openOrder}
           onChangeTableStatus={onChangeTableStatus}
           onSeeAll={() => onNavigateToTab('home')}
+          serviceType={activeSection}
         />
-
-        {/* TODAY'S SERVICE (extra — hidden for waiters) */}
-        {!isWaiter && (
-          <TodayServiceCard title="Cafe Today" stats={shiftStats} loading={extrasLoading} />
-        )}
 
         {/* BILL REQUESTS — most urgent waiter action */}
         {billRequests.length > 0 && (
@@ -373,21 +444,15 @@ export function DashboardScreen({
           />
         )}
 
-        {/* FLOOR PLAN (extra — hidden for waiters) */}
-        {!isWaiter && (
-          <FloorPlanGrid
-            tables={tables}
-            activeOrders={activeOrders}
-            isWaiter={isWaiter}
-            userId={user?.id}
-            getElapsed={getElapsedDiningTime}
-            onChangeTableStatus={onChangeTableStatus}
-            onSeeAll={() => onNavigateToTab('home')}
-          />
-        )}
-
-        {/* CAFE INSIGHTS / TOP SELLERS (extra — hidden for waiters) */}
-        {!isWaiter && <InsightsCard data={analytics} loading={extrasLoading} />}
+        {/* FLOOR PLAN — same for waiter and admin */}
+        <FloorPlanGrid
+          tables={filteredTables}
+          sections={sections}
+          activeOrders={activeOrders}
+          onChangeTableStatus={onChangeTableStatus}
+          onSeeAll={() => onNavigateToTab('home')}
+          serviceType={activeSection}
+        />
 
         {/* QUICK ACTIONS */}
         <SectionCard icon="lightning-bolt" iconColor={COLORS.purple} title="Quick Actions">
@@ -396,7 +461,7 @@ export function DashboardScreen({
               <View style={[styles.actionIconWrap, { backgroundColor: COLORS.orange + '18' }]}>
                 <MaterialCommunityIcons name="table-plus" size={24} color={COLORS.orange} />
               </View>
-              <Text style={styles.actionLabel}>{isWaiter ? 'My Tables' : 'Tables'}</Text>
+              <Text style={styles.actionLabel}>Tables</Text>
             </Hoverable>
             <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('orders')} hoverOpacity={0.7}>
               <View style={[styles.actionIconWrap, { backgroundColor: COLORS.primary + '18' }]}>
@@ -410,21 +475,13 @@ export function DashboardScreen({
               </View>
               <Text style={styles.actionLabel}>Menu</Text>
             </Hoverable>
-            {!isWaiter ? (
-              <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('kitchen')} hoverOpacity={0.7}>
-                <View style={[styles.actionIconWrap, { backgroundColor: COLORS.teal + '18' }]}>
-                  <MaterialCommunityIcons name="chef-hat" size={24} color={COLORS.teal} />
-                </View>
-                <Text style={styles.actionLabel}>Kitchen</Text>
-              </Hoverable>
-            ) : (
-              <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('history')} hoverOpacity={0.7}>
-                <View style={[styles.actionIconWrap, { backgroundColor: COLORS.cyan + '18' }]}>
-                  <MaterialCommunityIcons name="history" size={24} color={COLORS.cyan} />
-                </View>
-                <Text style={styles.actionLabel}>History</Text>
-              </Hoverable>
-            )}
+            {/* Parity: History for both waiter and admin. */}
+            <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('history')} hoverOpacity={0.7}>
+              <View style={[styles.actionIconWrap, { backgroundColor: COLORS.cyan + '18' }]}>
+                <MaterialCommunityIcons name="history" size={24} color={COLORS.cyan} />
+              </View>
+              <Text style={styles.actionLabel}>History</Text>
+            </Hoverable>
           </View>
         </SectionCard>
 
@@ -553,6 +610,7 @@ const styles = StyleSheet.create({
   /* Quick actions */
   actionsGrid: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 10,
   },
   actionBtn: {
@@ -571,5 +629,54 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     color: COLORS.text,
+  },
+
+  /* Section filter bar */
+  tablePromptWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+    marginBottom: 12,
+  },
+  tablePromptText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: COLORS.primary,
+    letterSpacing: 0.3,
+    textAlign: 'center',
+  },
+  sectionFilterBar: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+
+  sectionFilterBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    height: 48,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: SECTION_INACTIVE_BORDER,
+    backgroundColor: COLORS.white,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 8,
+  },
+  sectionFilterBtnActive: {
+    backgroundColor: SECTION_ACTIVE_FILL,
+    borderColor: SECTION_ACTIVE_FILL,
+  },
+
+  sectionFilterBtnText: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: SECTION_INACTIVE_TEXT,
+  },
+  sectionFilterBtnTextActive: {
+    color: COLORS.white,
+    fontWeight: '800',
   },
 });

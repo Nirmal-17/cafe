@@ -53,11 +53,37 @@ CafeOS — restaurant POS (waiter + kitchen + cashier) built as Expo SDK 57 / Re
 - LoginScreen: Server URL input is HIDDEN by default — triple-tap the brand logo (loginlogo.jpg) to reveal/toggle the card; the typed URL is applied before every login attempt; username prefills per URL (untouched field only); debounced `/health` ping of the typed URL.
 - URL switch (`api.setBaseUrl` / `resetBaseUrl`): adopts that URL's own token (or none) and wipes menu/tables/active-order caches; `index.tsx applyServerUrl` re-derives auth state (signed in iff the new URL has a session) and clears notifications + cleared-history. Profile → Configure Server URL and the login screen both use this path.
 
+### Phase 3.6 — api.txt contract integration + ADMIN/WAITER login gate (2026-10-07, uncommitted)
+- Frontend targets the documented contract in repo-root `api.txt` (base `https://cafeos.leadingedge.com.np`). The default in `.env` EXPO_PUBLIC_API_URL + `src/config/apiConfig.ts` CAFEOS_PRODUCTION_URL is `https://cafeos.leadingedge.com.np` — the live host serving `/api/menu-item/all`, `/menucategory/all`, `/explore-menu/get-menu` (2026-10-08). Everything was coded to the doc + smoke-tested against the sibling backend instead.
+- LOGIN: body `{username, email: username, password}`; after success the role comes from the payload or `GET /auth/me` — ONLY ADMIN/WAITER pass (other or unknown role → 403 "Only Admin and Waiter…", previous token restored, session saved only after the gate).
+- api.txt wiring in `src/services/api.ts`: `getMe`, `getSettings` (currency/tax/serviceCharge/printerEnabled normalized to app shape with defaults), `getQr`, `getUnpaidBills`, `cashierCheckout` (clears the local active-order mirror on success). Menu: nested `GET /menu` is primary (`normalizeMenuCategories` fills id/categoryId/price/available); flat feeds only fallback. `startTableSession`/`cancelOrder`/`getOrders` fall back ONLY on route-missing (404/405/HTML/redirect) — never on network error or 500.
+- order-details: Payment card (QR image + Collect Payment) + checkout modal (amount, method CASH/CARD/UPI/QR); qr+bills refresh in background on every load; unpaid-bills feed drives payment when table detail excludes bill-requested orders (bills scoped to THIS table only — unscoped ids could settle another table's bill); success → `requestMainRefresh()` → switchMainTab('home') → `router.dismissTo('/')`. `handleRequestBill` also fires requestMainRefresh.
+- `table/[id]`: createOrder sends `waiterId`; menu list hides `available === false`. `mainTab.ts` new `requestMainRefresh()/subscribeMainRefresh()` bus; index.tsx subscribes → `fetchData()`.
+- FloorPlanGrid: busy tables WITHOUT activeSession stay visible to waiters (servers with no session model would otherwise hide every occupied table — MyTableScreen already had this unassigned escape).
+- Smoke-tested vs sibling backend (prisma/dev.db, port 3000, stopped after): login returns role inline ✓, /auth/me ✓, /settings `{}` → defaults ✓, /tables + /tables/:id (`orders` key — order-details reads `orders || activeOrders`) ✓, nested /menu items `{id,price,available,image}` ✓, /orders `{orders,page,limit,total,hasMore}` ✓, /qr + /cashier/unpaid-bills 404 → fallbacks engage ✓ (4/5 rate-limit logins used).
+- Verify: `npx tsc --noEmit` clean; `npx expo lint` 0 errors, 31 pre-existing warnings.
+
 ## Dev logins (local DB — only against a running backend)
-- waiter@leadingedge.com / Wait3rCafe123 (WAITER)
-- chef@leadingedge.com / Ch3fCafe123 (CHEF)
-- cashier@leadingedge.com / Cash1erCafe123 (CASHIER)
+- waiter@leadingedge.com / Wait3rCafe123 (WAITER) - login matches email OR exact
+  name, so the full address must be typed (bare "waiter" does not match)
+- admin / admin@leadingedge.com / 123@dmin (ADMIN)
 Passwords come from backend/.env SEED_*_PASSWORD (fallback defaults if unset).
+The trimmed seed creates only those two accounts (the app admits ADMIN/WAITER
+only). Backend lives OUTSIDE this repo, at
+`C:\Users\user\OneDrive\Desktop\cafe\cafe-os-mobile-app-react-native\backend`,
+and must be running for http://localhost:3000 - `cd backend && npm run dev`.
+
+## Login troubleshooting (2026-10-08)
+- Two hosts matter: local `http://localhost:3000` (full API, backend must be
+  running) and hosted `https://cafeos.leadingedge.com.np` (menu/table feeds plus
+  `POST /api/account/login` only - no /auth/me, /settings, /tables, /orders).
+- Hosted login returns no role and `/api/auth/me` 404s: `api.login()` admits the
+  account as WAITER (least-privileged allowed role) rather than refusing a
+  correct password. Servers that DO expose /auth/me still enforce the
+  ADMIN/WAITER-only gate, and a failing (non-404) /auth/me is still surfaced.
+- Login screen: when the typed URL does not answer it offers a one-tap switch to
+  the default live server; `/health` probes treat any HTTP answer (404 included)
+  as reachable, so a route-less host is never shown as "offline".
 
 ## Commands
 - Backend dev: `cd backend && npm run dev` (ts-node-dev); build: `npx tsc` → run `node dist/app.js`

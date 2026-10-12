@@ -16,6 +16,8 @@ interface HoverableProps extends Omit<TouchableOpacityProps, 'onPress' | 'style'
   accessibilityState?: Record<string, any>;
   accessible?: boolean;
   id?: string;
+  onHoverIn?: (e?: any) => void;
+  onHoverOut?: (e?: any) => void;
 }
 
 export const Hoverable = forwardRef<React.ElementRef<typeof TouchableOpacity>, HoverableProps>(
@@ -32,12 +34,26 @@ export const Hoverable = forwardRef<React.ElementRef<typeof TouchableOpacity>, H
     accessibilityState,
     accessible,
     id,
+    onHoverIn: externalHoverIn,
+    onHoverOut: externalHoverOut,
     ...rest
   }, ref) => {
     const [hovered, setHovered] = useState(false);
 
-    const onHoverIn = useCallback(() => setHovered(true), []);
-    const onHoverOut = useCallback(() => setHovered(false), []);
+    const onHoverIn = useCallback(
+      (e?: any) => {
+        setHovered(true);
+        (externalHoverIn as any)?.(e);
+      },
+      [externalHoverIn]
+    );
+    const onHoverOut = useCallback(
+      (e?: any) => {
+        setHovered(false);
+        (externalHoverOut as any)?.(e);
+      },
+      [externalHoverOut]
+    );
 
     const webStyle = Platform.OS === 'web' && hovered
       ? (hoverStyle ?? { opacity: hoverOpacity })

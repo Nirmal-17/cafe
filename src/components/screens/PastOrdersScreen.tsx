@@ -93,13 +93,14 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
-  const [showDatePicker, setShowDatePicker] = useState<'from' | 'to' | null>(null);
+  const [showDatePicker, setShowDatePicker] = useState<null | 'from' | 'to'>(null);
+
   const [historyCleared, setHistoryCleared] = useState(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const userId = user?.id ?? null;
 
-  const fetchOrders = useCallback(async (search?: string, status?: HistoryStatus, from?: string, to?: string) => {
+  const fetchOrders = useCallback(async (search?: string, status?: HistoryStatus) => {
     setLoading(true);
     try {
       const isPaidFilter = status === 'PAID';
@@ -110,8 +111,6 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
         search: search || undefined,
         status: statusParam,
         waiterId: user?.id,
-        dateFrom: from || undefined,
-        dateTo: to || undefined,
       });
       if (res.success && res.data) {
         const list = isPaidFilter
@@ -135,28 +134,18 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
     });
   }, [fetchOrders]);
 
-  const handleSearch = useCallback((q: string) => {
+const handleSearch = useCallback((q: string) => {
     setSearchQuery(q);
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     searchTimerRef.current = setTimeout(() => {
-      fetchOrders(q, statusFilter, dateFrom || undefined, dateTo || undefined);
+      fetchOrders(q, statusFilter);
     }, 400);
-  }, [statusFilter, dateFrom, dateTo, fetchOrders]);
-
-  const handleDateFilter = useCallback(() => {
-    fetchOrders(searchQuery, statusFilter, dateFrom || undefined, dateTo || undefined);
-  }, [searchQuery, statusFilter, dateFrom, dateTo, fetchOrders]);
-
-  const clearDateFilter = useCallback(() => {
-    setDateFrom('');
-    setDateTo('');
-    fetchOrders(searchQuery, statusFilter, undefined, undefined);
-  }, [searchQuery, statusFilter, fetchOrders]);
+  }, [statusFilter, fetchOrders]);
 
   const handleStatusChange = useCallback((s: HistoryStatus) => {
     setStatusFilter(s);
-    fetchOrders(searchQuery, s, dateFrom || undefined, dateTo || undefined);
-  }, [searchQuery, dateFrom, dateTo, fetchOrders]);
+    fetchOrders(searchQuery, s);
+  }, [searchQuery, statusFilter, fetchOrders]);
 
   const grouped = useMemo(() => groupOrdersByDate(orders), [orders]);
 
@@ -318,38 +307,6 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
           )}
         </View>
 
-        {/* Date Filter */}
-        <View style={styles.dateFilterSection}>
-          <View style={styles.dateInputRow}>
-            <TouchableOpacity
-              style={[styles.dateInput, dateFrom && styles.dateInputActive]}
-              onPress={() => setShowDatePicker('from')}
-            >
-              <MaterialIcons name="calendar-today" size={14} color={dateFrom ? BRAND_ORANGE : TEXT_MUTED} />
-              <Text style={[styles.dateInputText, dateFrom && styles.dateInputTextActive]}>
-                {dateFrom || 'From'}
-              </Text>
-            </TouchableOpacity>
-            <View style={{ marginHorizontal: 4 }}>
-              <MaterialIcons name="arrow-forward" size={16} color={TEXT_MUTED} />
-            </View>
-            <TouchableOpacity
-              style={[styles.dateInput, dateTo && styles.dateInputActive]}
-              onPress={() => setShowDatePicker('to')}
-            >
-              <MaterialIcons name="calendar-today" size={14} color={dateTo ? BRAND_ORANGE : TEXT_MUTED} />
-              <Text style={[styles.dateInputText, dateTo && styles.dateInputTextActive]}>
-                {dateTo || 'To'}
-              </Text>
-            </TouchableOpacity>
-            {!!(dateFrom || dateTo) && (
-              <TouchableOpacity onPress={clearDateFilter} style={styles.clearDateBtn}>
-                <MaterialIcons name="close" size={16} color={COLOR_ERROR} />
-              </TouchableOpacity>
-            )}
-          </View>
-        </View>
-
         {/* Status Filters */}
         <View style={styles.filterRow}>
           {(['ALL', 'COMPLETED', 'CANCELLED', 'SERVED', 'PAID'] as const).map((s) => {
@@ -396,8 +353,8 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
             {historyCleared ? (
               <Text style={{ color: TEXT_MUTED, marginTop: 4 }}>All past order receipts have been deleted.</Text>
             ) : (
-              !!(searchQuery || dateFrom || dateTo) && (
-                <TouchableOpacity onPress={() => { setSearchQuery(''); setDateFrom(''); setDateTo(''); fetchOrders(undefined, 'ALL', undefined, undefined); }}>
+              !!(searchQuery || statusFilter !== 'ALL') && (
+                <TouchableOpacity onPress={() => { setSearchQuery(''); setStatusFilter('ALL'); fetchOrders(undefined, 'ALL'); }}>
                   <Text style={{ color: BRAND_ORANGE, fontWeight: '600', marginTop: 4 }}>Clear filters</Text>
                 </TouchableOpacity>
               )
@@ -465,33 +422,6 @@ export function PastOrdersScreen({ user, onBack }: PastOrdersScreenProps) {
           ))
         )}
       </ScrollView>
-
-      {/* Date Picker Modal */}
-      <Modal visible={showDatePicker !== null} transparent animationType="fade" onRequestClose={() => setShowDatePicker(null)}>
-        <Pressable style={styles.modalOverlay} onPress={() => setShowDatePicker(null)}>
-          <Pressable style={styles.datePickerModal} onPress={(e) => e.stopPropagation()}>
-            <Text style={styles.datePickerTitle}>{showDatePicker === 'from' ? 'Select Start Date' : 'Select End Date'}</Text>
-            <Text style={styles.datePickerHint}>Enter date as YYYY-MM-DD</Text>
-            <TextInput
-              style={styles.datePickerInput}
-              placeholder="YYYY-MM-DD"
-              placeholderTextColor={TEXT_MUTED}
-              value={showDatePicker === 'from' ? dateFrom : dateTo}
-              onChangeText={(t) => showDatePicker === 'from' ? setDateFrom(t) : setDateTo(t)}
-              maxLength={10}
-              autoFocus
-            />
-            <View style={styles.datePickerActions}>
-              <TouchableOpacity style={styles.datePickerCancel} onPress={() => setShowDatePicker(null)}>
-                <Text style={styles.datePickerCancelText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.datePickerApply} onPress={() => { setShowDatePicker(null); handleDateFilter(); }}>
-                <Text style={styles.datePickerApplyText}>Apply</Text>
-              </TouchableOpacity>
-            </View>
-          </Pressable>
-        </Pressable>
-      </Modal>
 
       {/* Receipt Detail Modal */}
       <Modal visible={selectedOrder !== null} transparent animationType="slide" onRequestClose={() => setSelectedOrder(null)}>

@@ -16,7 +16,7 @@ import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { api, StaffUser } from '@/services/api';
 import { loadSession, saveSession, savedUsername } from '@/utils/sessions';
-import { describeLoopbackIssue } from '@/config/apiConfig';
+import { DEFAULT_BASE_URL, describeLoopbackIssue } from '@/config/apiConfig';
 
 const COLORS = {
   panel: '#3F3D77',
@@ -87,6 +87,14 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const schemeSuggestion =
     probeTarget.ok && schemeProbe && schemeProbe.url === probeTarget.url ? schemeProbe.alternate : null;
 
+  // A URL that simply does not answer (local backend switched off, an old host
+  // that has left DNS) is a dead end on its own. When there IS a known-live
+  // server to move to, offer it as a one-tap switch.
+  const liveServerSuggestion =
+    serverOffline && !schemeSuggestion && normalizedServerUrl !== DEFAULT_BASE_URL
+      ? DEFAULT_BASE_URL
+      : null;
+
   const handleSaveServerUrl = () => {
     const check = api.validateBaseUrl(serverUrlInput);
     if (!check.ok) {
@@ -155,6 +163,18 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
       clearTimeout(timer);
     };
   }, [serverUrlInput]);
+
+  // Adopt the known-live server offered when the typed URL does not answer.
+  const handleUseLiveServer = () => {
+    if (!liveServerSuggestion) return;
+    const saved = api.setBaseUrl(liveServerSuggestion);
+    setServerUrlInput(saved);
+    setServerOffline(false);
+    setSchemeProbe(null);
+    if (!usernameTouchedRef.current) setUsername(savedUsername(saved));
+    setAuthError('');
+    setNotice(`Server URL saved - ${saved}`);
+  };
 
   const handleLogin = async () => {
     if (!serverUrlInput.trim()) {
@@ -267,6 +287,22 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
             {schemeSuggestion
               ? `${serverUrlInput.trim() || api.getBaseUrl()} isn't answering — ${schemeSuggestion} is. Tap here to switch.`
               : `Cannot reach ${serverUrlInput.trim() || api.getBaseUrl()} — check the server URL or start the backend.`}
+          </Text>
+        </Hoverable>
+      ) : null}
+
+      {liveServerSuggestion ? (
+        <Hoverable
+          style={[
+            styles.errorBox,
+            { padding: s(12), marginBottom: s(14), backgroundColor: '#DBEAFE', borderColor: '#93C5FD' },
+          ]}
+          onPress={handleUseLiveServer}
+          hoverOpacity={0.85}
+        >
+          <MaterialCommunityIcons name="swap-horizontal" size={s(18)} color="#1D4ED8" />
+          <Text style={[styles.errorText, { color: '#1D4ED8', fontSize: s(13) }]}>
+            {`${serverUrlInput.trim() || api.getBaseUrl()} is not answering - tap to use ${liveServerSuggestion} instead.`}
           </Text>
         </Hoverable>
       ) : null}

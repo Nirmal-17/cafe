@@ -1,3 +1,4 @@
+
 {
   "cli": {
     "version": ">= 3.0.0"
@@ -5,7 +6,7 @@
   "build": {
     "development": {
       "developmentClient": true,
-      "distribution": "development",
+      "distribution": "internal",
       "ios": {
         "simulator": false
       },
@@ -15,16 +16,13 @@
     },
     "development-simulator": {
       "developmentClient": true,
-      "distribution": "development",
+      "distribution": "internal",
       "ios": {
         "simulator": true
       }
     },
     "preview": {
-      "distribution": "preview",
-      "ios": {
-        "simulator": false
-      },
+      "distribution": "internal",
       "android": {
         "buildType": "apk"
       }
@@ -32,7 +30,7 @@
     "production": {
       "ios": {},
       "android": {
-        "gradleCommand": "./gradlew assembleRelease"
+        "buildType": "app-bundle"
       }
     }
   },

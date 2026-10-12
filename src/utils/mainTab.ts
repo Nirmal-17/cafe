@@ -1,6 +1,6 @@
 import { setStorageItemSync } from '@/utils/storage';
 
-export type MainTab = 'home' | 'dashboard' | 'menu' | 'orders' | 'profile' | 'history' | 'kitchen' | 'notifications';
+export type MainTab = 'home' | 'dashboard' | 'menu' | 'orders' | 'profile' | 'history' | 'notifications';
 
 type Listener = (tab: MainTab) => void;
 
@@ -21,5 +21,25 @@ export function subscribeMainTabSwitch(listener: Listener): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
+  };
+}
+
+type RefreshListener = () => void;
+
+const refreshListeners = new Set<RefreshListener>();
+
+/**
+ * Ask the main screen to resync with the server right now — used after a
+ * write from a pushed screen (bill request, cashier checkout) whose effect on
+ * tables/orders must show up immediately instead of on the next heartbeat.
+ */
+export function requestMainRefresh(): void {
+  refreshListeners.forEach((listener) => listener());
+}
+
+export function subscribeMainRefresh(listener: RefreshListener): () => void {
+  refreshListeners.add(listener);
+  return () => {
+    refreshListeners.delete(listener);
   };
 }

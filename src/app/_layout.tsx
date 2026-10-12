@@ -7,10 +7,11 @@ import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { AlertDialog } from '@/components/AlertDialog';
 import { BottomToast } from '@/components/BottomToast';
 import { useEffect, useRef, useState } from 'react';
-import { api } from '@/services/api';
+import { api, TABLE_STATUS_OVERRIDES_KEY } from '@/services/api';
 import { BASE_URL_STORAGE_KEY } from '@/config/apiConfig';
 import { getStorageItemSync, initStorageHydration } from '@/utils/storage';
 import { loadSession } from '@/utils/sessions';
+import { RESERVATIONS_STORAGE_KEY, primeReservations } from '@/utils/reservations';
 import {
   useFonts,
   Archivo_400Regular,
@@ -30,6 +31,12 @@ const PERSISTED_KEYS = [
   'smart_cafe_active_orders',
   'smart_cafe_notifications',
   'smart_cafe_cleared_history',
+  // Local table statuses (read-only feed servers) must survive a restart too,
+  // or a freed table would flip back to its feed value on the next launch.
+  TABLE_STATUS_OVERRIDES_KEY,
+  // Reservation codes must survive a restart or a booked table would lose
+  // its RES-#### id on the next launch.
+  RESERVATIONS_STORAGE_KEY,
 ];
 
 export default function Layout() {
@@ -62,6 +69,8 @@ export default function Layout() {
         api.setBaseUrl(savedBaseUrl.trim());
       }
       const session = loadSession(api.getBaseUrl());
+      // Same behaviour on web and native: a saved session keeps the user
+      // signed in across refresh/restart with the same activities.
       api.setToken(session?.token ?? null);
       setStorageReady(true);
     };
@@ -70,6 +79,8 @@ export default function Layout() {
     const fallback = setTimeout(applyPersisted, 2000);
     initStorageHydration(PERSISTED_KEYS).then(() => {
       clearTimeout(fallback);
+      // Codes read from AsyncStorage are invisible to the store until now.
+      primeReservations();
       applyPersisted();
     });
     return () => {
@@ -89,6 +100,8 @@ export default function Layout() {
 
   useEffect(() => {
     if (!storageReady) return;
+    // Web and native share the same rule: a saved session or an in-memory
+    // token grants access, so the same login sees the same activities.
     const hasToken = Boolean(loadSession(api.getBaseUrl())?.token) || Boolean(api.getToken());
     if (!hasToken && pathname !== '/' && pathname !== '') {
       routerRef.current.replace('/' as any);

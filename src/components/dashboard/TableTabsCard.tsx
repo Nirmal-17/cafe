@@ -4,29 +4,29 @@ import React, { useMemo, useState } from 'react';
 import { Text, View, StyleSheet, Modal, Pressable, TouchableOpacity } from 'react-native';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
-import { Order, Table } from '@/services/api';
+import { Order, Section, Table, isReservedTable } from '@/services/api';
+import { resolveTableSectionName, groupTablesBySection } from '@/utils/tableSections';
 import { useResponsive, getResponsiveValue } from '@/utils/responsive';
-import { isOpenOrder, sumOpenValue } from '@/utils/openValue';
+import { isOpenOrder } from '@/utils/openValue';
 import {
   COLORS,
   SectionCard,
-  STATUS_COLORS,
   TABLE_STATUS_COLORS,
-  formatMoney,
 } from './shared';
 import { useRouter } from 'expo-router';
-import { homeApi } from '@/services/homeApi';
-import { webAlert } from '@/utils/webAlert';
+import { filterTablesByServiceType, getServiceTypeLabel, ServiceType } from '@/utils/diningArea';
 
-type TableTab = 'ALL' | 'FREE' | 'RESERVED';
+type TableTab = 'ALL' | 'FREE' | 'RESERVED' | 'DINE-IN' | 'DELIVERY' | 'TAKEAWAY';
 
 interface TableTabsCardProps {
   tables: Table[];
+  sections?: Section[];
   activeOrders: Order[];
   getElapsed: (tableId: number) => string;
   onOrderPress: (order: Order) => void;
   onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
+  serviceType?: ServiceType | 'all';
 }
 
 const TABS: { key: TableTab; label: string; color: string }[] = [
@@ -35,41 +35,37 @@ const TABS: { key: TableTab; label: string; color: string }[] = [
   { key: 'RESERVED', label: 'Reserved', color: TABLE_STATUS_COLORS.RESERVED },
 ];
 
+const SERVICE_TYPE_TABS: { key: TableTab; label: string; color: string }[] = [
+  { key: 'DINE-IN', label: 'Dine-in', color: '#16A34A' },
+  { key: 'DELIVERY', label: 'Delivery', color: '#F59E0B' },
+  { key: 'TAKEAWAY', label: 'Takeaway', color: '#EF4444' },
+];
+
 const STATUS_LABELS: Record<string, string> = {
   AVAILABLE: 'Free',
   RESERVED: 'Reserved',
-  OCCUPIED: 'Occupied',
-  PENDING_BILL: 'Pending Bill',
-  CLEANING: 'Cleaning',
 };
 
 function getStatus(table: Table): string {
-  return String(table.status).toUpperCase();
-}
-
-function isReservedTable(table: Table): boolean {
-  return getStatus(table) === 'RESERVED' || table.is_reserved === true;
+  return isReservedTable(table) ? 'RESERVED' : 'AVAILABLE';
 }
 
 function tablePriority(table: Table): number {
-  const status = getStatus(table);
-  if (status === 'PENDING_BILL') return 1;
-  if (status === 'OCCUPIED') return 2;
-  if (status === 'RESERVED') return 3;
-  if (status === 'AVAILABLE') return 4;
-  if (status === 'CLEANING') return 5;
-  return 6;
+  return isReservedTable(table) ? 1 : 2;
 }
 
 export function TableTabsCard({
   tables,
+  sections,
   activeOrders,
   getElapsed,
   onOrderPress,
   onChangeTableStatus,
   onSeeAll,
+  serviceType,
 }: TableTabsCardProps) {
   const [tab, setTab] = useState<TableTab>('ALL');
+  const [hoveredTab, setHoveredTab] = useState<TableTab | null>(null);
   const [modalTable, setModalTable] = useState<Table | null>(null);
   const { breakpoint } = useResponsive();
   const router = useRouter();
@@ -100,24 +96,13 @@ export function TableTabsCard({
     return map;
   }, [activeOrders]);
 
-  const handleTakeOrder = async (table: Table) => {
+  // Reserve-only: taking an order never changes table status.
+  const handleTakeOrder = (table: Table) => {
     const orders = ordersByTable.get(table.id) ?? [];
-    if (orders.some(isOpenOrder)) {
-      closeModal();
-      router.push(`/order-details/${table.id}` as any);
-      return;
-    }
     closeModal();
-    try {
-      const res = await homeApi.startTableSession(table.id);
-      if (res.success) {
-        router.push(`/table/${table.id}` as any);
-      } else {
-        webAlert('Error', res.error || 'Failed to start service');
-      }
-    } catch {
-      webAlert('Error', 'Network error — could not start service');
-    }
+    router.push(
+      (orders.some(isOpenOrder) ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
+    );
   };
 
   const handleFreeTable = async (table: Table) => {
@@ -148,6 +133,11 @@ export function TableTabsCard({
       all: visibleTables.length,
       free: visibleTables.filter((t) => getStatus(t) === 'AVAILABLE').length,
       reserved: visibleTables.filter((t) => isReservedTable(t)).length,
+      // Shared helper, so the counts match what each tab actually displays
+      // (Delivery/Takeaway fall back to the shared tables when empty).
+      dineIn: filterTablesByServiceType(visibleTables, 'dine-in').length,
+      delivery: filterTablesByServiceType(visibleTables, 'delivery').length,
+      takeaway: filterTablesByServiceType(visibleTables, 'takeaway').length,
     }),
     [visibleTables],
   );
@@ -155,33 +145,66 @@ export function TableTabsCard({
   const tabTables = useMemo(() => {
     if (tab === 'FREE') return visibleTables.filter((t) => getStatus(t) === 'AVAILABLE');
     if (tab === 'RESERVED') return visibleTables.filter((t) => isReservedTable(t));
+    if (tab === 'DINE-IN' || tab === 'DELIVERY' || tab === 'TAKEAWAY') {
+      const want: ServiceType =
+        tab === 'DINE-IN' ? 'dine-in' : tab === 'DELIVERY' ? 'delivery' : 'takeaway';
+      return filterTablesByServiceType(visibleTables, want);
+    }
     return visibleTables;
   }, [visibleTables, tab]);
-
-  // Reserved / busy table tap → jump straight to that table's order screen
-  // (order details when it has open orders, place-order screen otherwise)
-  const openTableOrder = (table: Table) => {
-    const orders = ordersByTable.get(table.id) ?? [];
-    const hasOpenOrders = orders.some(isOpenOrder);
-    router.push(
-      (hasOpenOrders ? `/order-details/${table.id}` : `/table/${table.id}`) as any,
-    );
-  };
 
   const cellWidth = getResponsiveValue(
     { xs: '48.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' },
     breakpoint,
   ) as `${number}%`;
 
+  // Group the (already filtered + sorted) tables. Dine-in groups by dining
+  // area (Indoor / Outdoor / Roof / Cabin / Hall / Garden / Pool / Room) so
+  // every floor section gets its own heading. Delivery / Takeaway keep a
+  // single group under their own heading — area sub-headings would mislabel
+  // them ("Indoor" over T1..T8 in Takeaway). All / Free / Reserved keep the
+  // area grouping. Names resolve through the sections list — no nested
+  // section on hosted rows.
+  // The dashboard also filters from the outside (Dine In / Delivery /
+  // Takeaway buttons): when that outer filter is Delivery/Takeaway, the inner
+  // ALL/FREE/RESERVED views keep the single service heading too — otherwise
+  // the shared fallback tables would render under "Indoor" while Delivery is
+  // selected. Matches FloorPlanGrid's outer-filter grouping.
+  const groupedTables = useMemo<[string, Table[]][]>(
+    () => {
+      if (tab === 'DELIVERY' || tab === 'TAKEAWAY') {
+        return tabTables.length > 0
+          ? [[getServiceTypeLabel(tab.toLowerCase()), tabTables]]
+          : [];
+      }
+      if (
+        (tab === 'ALL' || tab === 'FREE' || tab === 'RESERVED') &&
+        (serviceType === 'delivery' || serviceType === 'takeaway')
+      ) {
+        return tabTables.length > 0
+          ? [[getServiceTypeLabel(serviceType), tabTables]]
+          : [];
+      }
+      return groupTablesBySection(tabTables, sections);
+    },
+    [tabTables, sections, tab, serviceType],
+  );
+
   const tabColor =
-    TABS.find((t) => t.key === tab)?.color || COLORS.primary;
+    [...TABS, ...SERVICE_TYPE_TABS].find((t) => t.key === tab)?.color || COLORS.primary;
 
   const emptyText =
     tab === 'FREE'
       ? 'No free tables right now'
       : tab === 'RESERVED'
         ? 'No reserved tables'
-        : 'No tables found';
+        : tab === 'DINE-IN'
+          ? 'No dine-in tables'
+          : tab === 'DELIVERY'
+            ? 'No delivery tables'
+            : tab === 'TAKEAWAY'
+              ? 'No takeaway tables'
+              : 'No tables found';
 
   return (
     <>
@@ -198,6 +221,8 @@ export function TableTabsCard({
         <View style={styles.tabsRow}>
           {TABS.map((item) => {
             const isActive = tab === item.key;
+            const isHovered = hoveredTab === item.key;
+            const highlighted = isActive || isHovered;
             const count =
               item.key === 'ALL'
               ? counts.all
@@ -210,14 +235,53 @@ export function TableTabsCard({
               key={item.key}
               style={[
                 styles.tab,
-                isActive && { backgroundColor: item.color, borderColor: item.color },
+                highlighted && { backgroundColor: item.color, borderColor: item.color },
               ]}
+              hoverStyle={{ backgroundColor: item.color, borderColor: item.color }}
               onPress={() => setTab(item.key)}
-              hoverOpacity={0.8}
+              onHoverIn={() => setHoveredTab(item.key)}
+              onHoverOut={() => setHoveredTab((cur) => (cur === item.key ? null : cur))}
+              hoverOpacity={1}
               accessibilityRole="button"
               accessibilityState={{ selected: isActive }}
             >
-              <Text style={[styles.tabText, isActive && styles.tabTextActive]}>
+              <Text style={[styles.tabText, highlighted && styles.tabTextActive]}>
+                {item.label} ({count})
+              </Text>
+            </Hoverable>
+          );
+        })}
+        </View>
+
+        {/* SERVICE TYPE: DINE-IN / DELIVERY / TAKEAWAY */}
+        <View style={styles.tabsRow}>
+          {SERVICE_TYPE_TABS.map((item) => {
+            const isActive = tab === item.key;
+            const isHovered = hoveredTab === item.key;
+            const highlighted = isActive || isHovered;
+            const count =
+              item.key === 'DINE-IN'
+                ? counts.dineIn
+                : item.key === 'DELIVERY'
+                  ? counts.delivery
+                  : counts.takeaway;
+
+          return (
+            <Hoverable
+              key={item.key}
+              style={[
+                styles.tab,
+                highlighted && { backgroundColor: item.color, borderColor: item.color },
+              ]}
+              hoverStyle={{ backgroundColor: item.color, borderColor: item.color }}
+              onPress={() => setTab(isActive ? 'ALL' : item.key)}
+              onHoverIn={() => setHoveredTab(item.key)}
+              onHoverOut={() => setHoveredTab((cur) => (cur === item.key ? null : cur))}
+              hoverOpacity={1}
+              accessibilityRole="button"
+              accessibilityState={{ selected: isActive }}
+            >
+              <Text style={[styles.tabText, highlighted && styles.tabTextActive]}>
                 {item.label} ({count})
               </Text>
             </Hoverable>
@@ -231,118 +295,40 @@ export function TableTabsCard({
           <Text style={styles.emptyStateText}>{emptyText}</Text>
         </View>
       ) : (
-        <View style={styles.grid}>
-          {tabTables.map((table) => {
-            const baseStatus = getStatus(table);
-            const reserved = isReservedTable(table);
-            const status =
-              reserved && baseStatus === 'AVAILABLE' ? 'RESERVED' : baseStatus;
-            const color = TABLE_STATUS_COLORS[status] || COLORS.primary;
+        <>
+          {groupedTables.map(([sectionName, sectionTables]) => (
+            <View key={sectionName} style={styles.sectionGroup}>
+              <Text style={styles.sectionHeading}>{sectionName}</Text>
+              <View style={styles.grid}>
+                {sectionTables.map((table) => {
+            // Reserve-only: Reserved (solid purple + white text) or Free (white).
+            const reservedTile = isReservedTable(table);
+            const status = reservedTile ? 'RESERVED' : 'AVAILABLE';
             const label = STATUS_LABELS[status] || status;
-            const orders = ordersByTable.get(table.id) ?? [];
-            const openValue = sumOpenValue(orders);
-            const busy = status === 'OCCUPIED' || status === 'PENDING_BILL';
-            const purpleTile = status === 'RESERVED' || status === 'OCCUPIED';
-            const freeTile = status === 'AVAILABLE';
-            const purple = TABLE_STATUS_COLORS.RESERVED;
-            const tileBackground = purpleTile
-              ? purple
-              : freeTile
-                ? COLORS.white
-                : color + '12';
-            const tileBorder = purpleTile ? purple : COLORS.white;
-            const contentColor = purpleTile ? COLORS.white : COLORS.text;
-            const metaColor = purpleTile ? '#EDE9FE' : COLORS.muted;
-
-            const footer: string[] = [];
-            if (busy) footer.push(getElapsed(table.id));
-            if (openValue > 0) footer.push(formatMoney(openValue));
-
-            const targetOrder = orders.find(isOpenOrder) ?? orders[0];
-
-            const isAvailable = status === 'AVAILABLE';
+            const tileBackground = reservedTile ? TABLE_STATUS_COLORS.RESERVED : '#FFFFFF';
+            const tileBorder = reservedTile ? TABLE_STATUS_COLORS.RESERVED : '#E5E7EB';
+            const contentColor = reservedTile ? COLORS.white : '#111827';
 
             return (
               <View key={table.id} style={[styles.cell, { width: cellWidth }]}>
                 <Hoverable
                   style={[styles.tile, { backgroundColor: tileBackground, borderColor: tileBorder }]}
-                  onPress={() => {
-                    if (isAvailable || isReservedTable(table)) handleTablePress(table);
-                    else if (status !== 'CLEANING') openTableOrder(table);
-                  }}
+                  onPress={() => handleTablePress(table)}
                   hoverOpacity={0.85}
                   accessibilityRole="button"
                   accessibilityLabel={`Table ${table.tableNumber}, ${label}`}
                 >
-                  <View style={styles.tileTop}>
-                    <Text style={[styles.tileNumber, { color: contentColor }]} numberOfLines={1}>
-                      {table.tableNumber}
-                    </Text>
-
-                    <View style={styles.tileTopRight}>
-                      <View
-                        style={[
-                          styles.statusDot,
-                          { backgroundColor: purpleTile ? COLORS.white : color },
-                        ]}
-                      />
-                      {orders.length > 0 && targetOrder && (
-                        <Hoverable
-                          style={[
-                            styles.orderChip,
-                            {
-                              backgroundColor:
-                                STATUS_COLORS[targetOrder.status] || COLORS.primary,
-                            },
-                          ]}
-                          onPress={() => onOrderPress(targetOrder)}
-                          hoverOpacity={0.8}
-                          accessibilityRole="button"
-                          accessibilityLabel={`${orders.length} orders for table ${table.tableNumber}`}
-                        >
-                          <MaterialCommunityIcons
-                            name="receipt"
-                            size={9}
-                            color={COLORS.white}
-                          />
-                          <Text style={styles.orderChipText}>{orders.length}</Text>
-                        </Hoverable>
-                      )}
-                    </View>
-                  </View>
-
-                  <Text style={[styles.tileStatus, { color: contentColor }]} numberOfLines={1}>
-                    {label}
+                  <Text style={[styles.tileNumber, { color: contentColor }]} numberOfLines={1}>
+                    {table.tableNumber}
                   </Text>
-
-                  <View style={styles.tileMeta}>
-                    <MaterialCommunityIcons
-                      name="seat"
-                      size={10}
-                      color={purpleTile ? '#EDE9FE' : COLORS.muted}
-                    />
-                    <Text style={[styles.tileMetaText, { color: metaColor }]} numberOfLines={1}>
-                      {table.capacity} seats
-                      {table.section?.name ? ` · ${table.section.name}` : ''}
-                    </Text>
-                  </View>
-
-                  {footer.length > 0 && (
-                    <Text
-                      style={[
-                        styles.tileFooter,
-                        { color: purpleTile ? COLORS.white : COLORS.primary },
-                      ]}
-                      numberOfLines={1}
-                    >
-                      {footer.join(' · ')}
-                    </Text>
-                  )}
                 </Hoverable>
               </View>
             );
           })}
-        </View>
+              </View>
+            </View>
+          ))}
+        </>
       )}
     </SectionCard>
 
@@ -361,7 +347,7 @@ export function TableTabsCard({
               </View>
 
               <Text style={styles.modalSubtitle}>
-                Section: {modalTable.section?.name || 'Main'}
+                Section: {resolveTableSectionName(modalTable, sections)}
               </Text>
 
               <Hoverable
@@ -421,7 +407,7 @@ const styles = StyleSheet.create({
   tab: {
     height: 30,
     paddingHorizontal: 12,
-    borderRadius: 15,
+    borderRadius: 6,
     backgroundColor: '#F8FAFC',
     borderWidth: 1,
     borderColor: '#E2E8F0',
@@ -444,17 +430,27 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     marginHorizontal: -4,
   },
+  sectionGroup: {
+    marginBottom: 12,
+  },
+  sectionHeading: {
+    fontSize: 19,
+    fontWeight: '800',
+    color: '#0E5A6B',
+    marginBottom: 8,
+  },
   cell: {
     paddingHorizontal: 4,
     paddingBottom: 8,
   },
   tile: {
-    borderRadius: 10,
+    borderRadius: 6,
     borderWidth: 1,
-    padding: 8,
-    minHeight: 74,
-    justifyContent: 'space-between',
-    gap: 3,
+    paddingHorizontal: 8,
+    paddingVertical: 12,
+    minHeight: 54,
+    justifyContent: 'center',
+    alignItems: 'center',
     shadowColor: '#0F172A',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.14,
@@ -474,9 +470,9 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   tileNumber: {
-    fontSize: 14,
-    fontWeight: '900',
-    flexShrink: 1,
+    fontSize: 15,
+    fontWeight: '800',
+    textAlign: 'center',
   },
   statusDot: {
     width: 7,
