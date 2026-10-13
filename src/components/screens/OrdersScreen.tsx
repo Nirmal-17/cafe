@@ -26,10 +26,8 @@ import {
 } from '@expo/vector-icons';
 
 import { Hoverable } from '@/components/Hoverable';
-import { showBottomToast } from '@/components/BottomToast';
 import { Order, api } from '@/services/api';
-import { webAlert } from '@/utils/webAlert';
-import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getGridGap, getCardPadding } from '@/utils/responsive';
+import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getCardPadding } from '@/utils/responsive';
 
 // ─────────────────────────────────────────────
 // Brand / semantic colors (Light Theme — matches Dashboard)
@@ -41,8 +39,6 @@ const BRAND_DARK_ORANGE = '#E65100';
 const BRAND_YELLOW = '#FFD600';
 const BRAND_BLACK = '#000000';
 const BRAND_WHITE = '#FFFFFF';
-
-const COLOR_SUCCESS = '#2E7D32';
 
 const BG_DARK = '#F0F4FF';
 const BG_SURFACE = '#FFFFFF';
@@ -102,10 +98,10 @@ export function OrdersScreen({
   onBookTable,
 }: OrdersScreenProps) {
   const { breakpoint } = useResponsive();
+  const { width: windowWidth } = useWindowDimensions();
   const scrollViewRef = useRef<ScrollView>(null);
 
   const [showGoToTop, setShowGoToTop] = useState(false);
-  const [cancelActionId, setCancelActionId] = useState<number | null>(null);
 
   // ─────────────────────────────────────────────
   // Resolve table name
@@ -203,15 +199,9 @@ export function OrdersScreen({
               return true;
             }
 
-            const matchesTableName = section.tableName
+            return section.tableName
               .toLowerCase()
               .includes(query);
-
-            const matchesOrderId = String(order.id).includes(
-              query
-            );
-
-            return matchesTableName || matchesOrderId;
           }
         );
 
@@ -224,153 +214,36 @@ export function OrdersScreen({
   }, [tableSections, orderStatusFilter, ordersSearchQuery]);
 
   // ─────────────────────────────────────────────
-  // Compute order total
+  // Aggregate a table's orders into one tab-card: merged item names + total
   // ─────────────────────────────────────────────
 
-  const getOrderTotal = useCallback((order: Order): number => {
-    const items = Array.isArray(order.items) ? order.items : [];
+  const getTableCardData = useCallback((section: TableSection): { lines: { name: string; qty: number }[]; total: number } => {
+    const merged = new Map<string, { name: string; qty: number }>();
+    let total = 0;
 
-    if (items.length > 0) {
-      return items.reduce((total, item) => {
-        const price = Number(item.price ?? 0);
-        const quantity = Number(item.quantity ?? 1);
-        return total + price * quantity;
-      }, 0);
+    for (const order of section.orders) {
+      const items = Array.isArray(order.items) ? order.items : [];
+      if (items.length > 0) {
+        for (const item of items) {
+          const name =
+            item.menuItem?.name ||
+            api.resolveMenuItemName(Number(item.menuItemId ?? 0));
+          const qty = Number(item.quantity ?? 1);
+          total += Number(item.price ?? 0) * qty;
+          const key = name.trim().toLowerCase();
+          const prev = merged.get(key);
+          if (prev) {
+            prev.qty += qty;
+          } else {
+            merged.set(key, { name, qty });
+          }
+        }
+      } else {
+        total += Number(order.totalAmount ?? 0);
+      }
     }
 
-    return Number(order.totalAmount ?? 0);
-  }, []);
-
-  // ─────────────────────────────────────────────
-  // Valid status transitions
-  // ─────────────────────────────────────────────
-
-  const getValidNextStatuses = useCallback((currentStatus: Order['status']): string[] => {
-    switch (currentStatus) {
-      case 'PENDING':
-      case 'CONFIRMED':
-      case 'PREPARING':
-      case 'READY':
-        return ['SERVED'];
-      default:
-        return [];
-    }
-  }, []);
-
-  // ─────────────────────────────────────────────
-  // Cancel order
-  // ─────────────────────────────────────────────
-
-  const confirmCancelOrder = useCallback(
-    async (order: Order, reason: string) => {
-      await webAlert(
-        'Confirm Cancellation',
-        `Cancel Order #${order.id}?\nReason: ${reason}\n\nAll ordered items will be discarded.`,
-        [
-          { text: 'Go Back', style: 'cancel' },
-          {
-            text: 'Yes, Cancel Order',
-            style: 'destructive',
-            onPress: async () => {
-              setCancelActionId(order.id);
-              try {
-                const res = await api.cancelOrder(order.id, reason);
-                if (!res.success) {
-                  throw new Error(res.error || 'Failed to cancel the order');
-                }
-                showBottomToast({
-                  title: `Order #${order.id} cancelled`,
-                  tone: 'success',
-                });
-                await onRefresh();
-              } catch (err: any) {
-                await webAlert(
-                  'Error',
-                  err?.message || 'Failed to cancel the order. Please try again.'
-                );
-              } finally {
-                setCancelActionId(null);
-              }
-            },
-          },
-        ]
-      );
-    },
-    [onRefresh]
-  );
-
-  const handleCancelOrder = useCallback(
-    (order: Order) => {
-      webAlert(
-        'Cancel Order',
-        `Are you sure you want to cancel Order #${order.id}? This will remove all ordered items from history.`,
-        [
-          { text: 'No', style: 'cancel' },
-          {
-            text: 'Customer Changed Mind',
-            onPress: () => confirmCancelOrder(order, 'Customer changed mind'),
-          },
-          {
-            text: 'Ordered by Mistake',
-            onPress: () => confirmCancelOrder(order, 'Ordered by mistake'),
-          },
-          {
-            text: 'Item Unavailable',
-            onPress: () => confirmCancelOrder(order, 'Item unavailable'),
-          },
-          {
-            text: 'Other Reason',
-            style: 'destructive',
-            onPress: () => confirmCancelOrder(order, 'Other'),
-          },
-        ]
-      );
-    },
-    [confirmCancelOrder]
-  );
-
-  // ─────────────────────────────────────────────
-  // Status colors
-  // ─────────────────────────────────────────────
-
-  const getStatusColors = useCallback((status: Order['status']) => {
-    switch (status) {
-      case 'PENDING':
-        return {
-          backgroundColor: '#FFF8E1',
-          color: '#F59E0B',
-        };
-
-      case 'PREPARING':
-        return {
-          backgroundColor: '#FFF3E0',
-          color: '#FF6D00',
-        };
-
-      case 'READY':
-        return {
-          backgroundColor: '#E8F5E9',
-          color: '#16A34A',
-        };
-
-      case 'SERVED':
-        return {
-          backgroundColor: '#E3F2FD',
-          color: '#073F78',
-        };
-
-      case 'CANCELLED':
-        return {
-          backgroundColor: '#FFEBEE',
-          color: '#D32F2F',
-        };
-
-      default:
-        return {
-          backgroundColor: '#F1F5F9',
-          color: TEXT_MUTED,
-        };
-    }
+    return { lines: Array.from(merged.values()), total };
   }, []);
 
   // ─────────────────────────────────────────────
@@ -450,7 +323,7 @@ export function OrdersScreen({
 
             <TextInput
               style={styles.searchInput}
-              placeholder="Search by table name or order ID..."
+              placeholder="Search by table name..."
               placeholderTextColor={TEXT_MUTED}
               value={ordersSearchQuery}
               onChangeText={setOrdersSearchQuery}
@@ -544,276 +417,75 @@ export function OrdersScreen({
           </Hoverable>
         </View>
 
-        {/* Orders */}
+        {/* Orders — one tab-card per table (tap opens full details) */}
         <View style={styles.ordersWrap}>
-        {/* Orders grouped by table */}
-        {filteredTableSections.map((section) => (
-          <View
-            key={section.tableId}
-            style={styles.tableSection}
-          >
-            {/* Table section header */}
-            <View style={styles.tableSectionHeader}>
-              <View style={styles.tableSectionHeaderLeft}>
-                <MaterialCommunityIcons
-                  name="table-furniture"
-                  size={18}
-                  color={BRAND_PRIMARY}
-                />
-                <Text style={styles.tableSectionTitle}>
+        <View style={styles.tabGrid}>
+        {filteredTableSections.map((section) => {
+          const { lines, total } = getTableCardData(section);
+          const MAX_VISIBLE_LINES = 4;
+          const visibleLines = lines.slice(0, MAX_VISIBLE_LINES);
+          const hiddenCount = lines.length - visibleLines.length;
+
+          return (
+            <Hoverable
+              key={section.tableId}
+              style={[
+                styles.tabCard,
+                { width: windowWidth >= 1024 ? '23.5%' : windowWidth >= 768 ? '31.5%' : '48%' },
+              ]}
+              hoverOpacity={0.85}
+              onPress={() => onOrderPress(section.tableId)}
+              accessibilityRole="button"
+              accessibilityLabel={`Open orders for ${section.tableName}`}
+            >
+              {/* Table header pill */}
+              <View style={styles.tabCardHeader}>
+                <Text style={styles.tabCardHeaderText} numberOfLines={1}>
                   {section.tableName}
                 </Text>
               </View>
-              <View style={styles.tableOrderCountBadge}>
-                <Text style={styles.tableOrderCountText}>
-                  {section.orders.length}{' '}
-                  {section.orders.length === 1
-                    ? 'order'
-                    : 'orders'}
+
+              {/* Item names */}
+              <View style={styles.tabCardBody}>
+                {visibleLines.map((line, index) => (
+                  <Text
+                    key={`${section.tableId}-${index}`}
+                    style={styles.orderItemText}
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                  >
+                    {line.name}
+                    {line.qty > 1 ? `  x${line.qty}` : ''}
+                  </Text>
+                ))}
+
+                {hiddenCount > 0 && (
+                  <Text style={styles.orderItemsMore}>
+                    +{hiddenCount} more item
+                    {hiddenCount > 1 ? 's' : ''}
+                  </Text>
+                )}
+
+                {lines.length === 0 && (
+                  <Text style={styles.orderItemText}>
+                    No items
+                  </Text>
+                )}
+              </View>
+
+              {/* Divider */}
+              <View style={styles.orderCardDivider} />
+
+              {/* Footer */}
+              <View style={styles.tabCardFooter}>
+                <Text style={styles.orderCardTotal}>
+                  Total: Rs. {total.toFixed(2)}
                 </Text>
               </View>
-            </View>
-
-            {/* Individual orders for this table */}
-            <View style={styles.tableOrdersList}>
-              {section.orders.map((order) => {
-                const statusColors = getStatusColors(
-                  order.status
-                );
-
-                const items = Array.isArray(order.items)
-                  ? order.items
-                  : [];
-
-                const orderTotal = getOrderTotal(order);
-
-                const MAX_VISIBLE_ITEMS = 4;
-                const visibleItems = items.slice(
-                  0,
-                  MAX_VISIBLE_ITEMS
-                );
-                const hiddenItemCount =
-                  items.length - visibleItems.length;
-
-                const showRequestBill =
-                  order.status === 'SERVED' &&
-                  order.paymentStatus !== 'PAID' &&
-                  !order.billRequested;
-
-                const showCancel =
-                  order.status !== 'CANCELLED' &&
-                  order.status !== 'COMPLETED' &&
-                  order.paymentStatus !== 'PAID';
-
-                return (
-                  <Hoverable
-                    key={order.id}
-                    style={styles.orderCard}
-                    hoverOpacity={0.85}
-                    onPress={() =>
-                      onOrderPress(section.tableId)
-                    }
-                    accessibilityRole={
-                      getValidNextStatuses(order.status)
-                        .length > 0
-                        ? 'none'
-                        : 'button'
-                    }
-                    accessibilityLabel={`Open order ${order.id}`}
-                  >
-                    {/* Order header: ID + status */}
-                    <View style={styles.orderCardHeader}>
-                      <Text style={styles.orderCardId}>
-                        Order #{order.id}
-                      </Text>
-                      <View
-                        style={[
-                          styles.orderStatusBadge,
-                          {
-                            backgroundColor:
-                              statusColors.backgroundColor,
-                          },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.orderStatusBadgeText,
-                            {
-                              color: statusColors.color,
-                            },
-                          ]}
-                        >
-                          {order.status}
-                        </Text>
-                      </View>
-                    </View>
-
-                    {/* Items */}
-                    <View style={styles.orderCardBody}>
-                      {visibleItems.map((item, index) => {
-                        const itemName =
-                          item.menuItem?.name ||
-                          api.resolveMenuItemName(
-                            Number(item.menuItemId ?? 0)
-                          );
-
-                        const quantity = Number(
-                          item.quantity ?? 1
-                        );
-
-                        const rate = Number(
-                          item.price ?? 0
-                        );
-
-                        return (
-                          <View
-                            key={
-                              item.id ??
-                              `${order.id}-${index}`
-                            }
-                            style={styles.orderItemRow}
-                          >
-                            <Text
-                              style={[
-                                styles.orderItemText,
-                                styles.orderItemName,
-                              ]}
-                              numberOfLines={1}
-                              ellipsizeMode="tail"
-                            >
-                              {itemName}
-                            </Text>
-
-                            <Text
-                              style={styles.orderItemQty}
-                            >
-                              Qty: {quantity}
-                            </Text>
-
-                            <Text
-                              style={styles.orderItemRate}
-                            >
-                              Rs. {rate.toFixed(2)}
-                            </Text>
-                          </View>
-                        );
-                      })}
-
-                      {hiddenItemCount > 0 && (
-                        <Text style={styles.orderItemsMore}>
-                          +{hiddenItemCount} more item
-                          {hiddenItemCount > 1 ? 's' : ''}
-                        </Text>
-                      )}
-
-                      {items.length === 0 && (
-                        <Text
-                          style={styles.orderItemText}
-                        >
-                          No items
-                        </Text>
-                      )}
-                    </View>
-
-                    {/* Divider */}
-                    <View style={styles.orderCardDivider} />
-
-                    {/* Status Actions */}
-                    {(getValidNextStatuses(order.status).length > 0 ||
-                      showRequestBill ||
-                      showCancel) && (
-                      <View style={styles.orderCardStatusActions}>
-                        {showRequestBill && (
-                          <Hoverable
-                            style={[
-                              styles.statusActionBtn,
-                              { backgroundColor: '#E0E7FF' },
-                            ]}
-                            onPress={() =>
-                              onOrderPress(section.tableId)
-                            }
-                            hoverOpacity={0.8}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Request bill for order ${order.id}`}
-                          >
-                            <Text
-                              style={[
-                                styles.statusActionBtnText,
-                                { color: BRAND_PRIMARY },
-                              ]}
-                            >
-                              Request Bill
-                            </Text>
-                          </Hoverable>
-                        )}
-
-                        {getValidNextStatuses(order.status).length > 0 && (
-                          <Hoverable
-                            style={[
-                              styles.statusActionBtn,
-                              { backgroundColor: '#DCFCE7' },
-                            ]}
-                            onPress={() => onOrderStatusChange(order.id, 'SERVED')}
-                            hoverOpacity={0.8}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Mark order ${order.id} as served`}
-                          >
-                            <Text
-                              style={[
-                                styles.statusActionBtnText,
-                                { color: COLOR_SUCCESS },
-                              ]}
-                            >
-                              Mark Served
-                            </Text>
-                          </Hoverable>
-                        )}
-
-                        {showCancel && (
-                          <Hoverable
-                            style={[
-                              styles.statusActionBtn,
-                              { backgroundColor: '#FEE2E2' },
-                              cancelActionId === order.id && styles.statusActionBtnDisabled,
-                            ]}
-                            onPress={() => handleCancelOrder(order)}
-                            disabled={cancelActionId === order.id}
-                            hoverOpacity={0.8}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Cancel order ${order.id}`}
-                          >
-                            {cancelActionId === order.id ? (
-                              <ActivityIndicator
-                                size="small"
-                                color="#DC2626"
-                              />
-                            ) : (
-                              <Text
-                                style={[
-                                  styles.statusActionBtnText,
-                                  { color: '#DC2626' },
-                                ]}
-                              >
-                                Cancel
-                              </Text>
-                            )}
-                          </Hoverable>
-                        )}
-                      </View>
-                    )}
-
-                    {/* Footer */}
-                    <View style={styles.orderCardFooter}>
-                      <Text style={styles.orderCardTotal}>
-                        Rs. {orderTotal.toFixed(2)}
-                      </Text>
-                    </View>
-                  </Hoverable>
-                );
-              })}
-            </View>
-          </View>
-        ))}
+            </Hoverable>
+          );
+        })}
+        </View>
 
         {/* Empty state */}
         {filteredTableSections.length === 0 && (
@@ -902,6 +574,48 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   ordersWrap: {
     paddingHorizontal: getSpacing(bp.breakpoint, 'sm'),
     marginTop: getSpacing(bp.breakpoint, 'sm'),
+  },
+
+  // Tab-card grid (one card per table — tap opens full details)
+  tabGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: getSpacing(bp.breakpoint, 'sm'),
+  },
+
+  tabCard: {
+    backgroundColor: BG_SURFACE,
+    borderWidth: 1.5,
+    borderColor: BORDER_COLOR,
+    borderRadius: getBorderRadius(bp.breakpoint, 'sm'),
+    padding: getCardPadding(bp.breakpoint),
+    marginBottom: getSpacing(bp.breakpoint, 'sm'),
+  },
+
+  tabCardHeader: {
+    backgroundColor: BRAND_PRIMARY,
+    borderRadius: getBorderRadius(bp.breakpoint, 'xs'),
+    paddingVertical: getSpacing(bp.breakpoint, 'xs'),
+    paddingHorizontal: getSpacing(bp.breakpoint, 'sm'),
+    alignItems: 'center',
+    marginBottom: getSpacing(bp.breakpoint, 'sm'),
+  },
+
+  tabCardHeaderText: {
+    color: BRAND_WHITE,
+    fontWeight: '800',
+    fontSize: getFontSize(bp.breakpoint, 'lg'),
+  },
+
+  tabCardBody: {
+    paddingHorizontal: moderateScale(2, 0.5, bp.breakpoint),
+    minHeight: moderateScale(110, 0.5, bp.breakpoint),
+  },
+
+  tabCardFooter: {
+    alignItems: 'flex-end',
+    paddingRight: moderateScale(2, 0.5, bp.breakpoint),
   },
 
   // Header

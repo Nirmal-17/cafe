@@ -114,22 +114,6 @@ export const filterTablesByServiceType = (
   });
 };
 
-/**
- * Outer-level service filter (dashboard / My Tables top buttons). Same as
- * filterTablesByServiceType, except Delivery/Takeaway fall back to the shared
- * tables when no dedicated delivery or takeaway tables exist — otherwise the
- * tab would render a blank screen. Inner tabs (TableTabsCard) intentionally
- * use the strict version so their counts stay truthful.
- */
-export const filterTablesByServiceTypeWithFallback = (
-  tables: Table[],
-  type: ServiceType | 'all'
-): Table[] => {
-  if (type === 'all') return tables;
-  const matched = filterTablesByServiceType(tables, type);
-  return matched.length > 0 ? matched : tables;
-};
-
 export const getTablesByServiceType = (
   tables: Table[],
   type: ServiceType

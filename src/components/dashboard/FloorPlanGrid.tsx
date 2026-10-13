@@ -10,7 +10,7 @@ import { useResponsive, getResponsiveValue } from '@/utils/responsive';
 import { isOpenOrder } from '@/utils/openValue';
 import { getReservationId, useReservationsRevision } from '@/utils/reservations';
 import { COLORS, SectionCard, TABLE_STATUS_COLORS } from './shared';
-import { filterTablesByServiceTypeWithFallback, getServiceTypeLabel } from '@/utils/diningArea';
+import { filterTablesByServiceType } from '@/utils/diningArea';
 import { Popover } from '@/components/Popover';
 import { useRouter } from 'expo-router';
 
@@ -20,6 +20,8 @@ interface FloorPlanGridProps {
   activeOrders: Order[];
   onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
+  // Kept for API compat — Floor Plan is Dine-In only, so this is ignored
+  // and delivery/takeaway tables never render here.
   serviceType?: 'dine-in' | 'delivery' | 'takeaway' | 'all';
 }
 
@@ -38,7 +40,6 @@ export function FloorPlanGrid({
   activeOrders,
   onChangeTableStatus,
   onSeeAll,
-  serviceType,
 }: FloorPlanGridProps) {
   const { breakpoint } = useResponsive();
   const [popoverTable, setPopoverTable] = useState<Table | null>(null);
@@ -104,14 +105,11 @@ export function FloorPlanGrid({
     await onChangeTableStatus(table.id, 'RESERVED');
   };
 
-  // Reserve-only: every table is visible to everyone (no session scoping).
-  // Same outer-level fallback as the dashboard: Delivery/Takeaway show the
-  // shared tables only when no dedicated Del*/Take* tables exist at all.
+  // Floor Plan is Dine-In only: it always shows dine-in tables grouped by
+  // dining area, no matter which Dine In / Delivery / Takeaway tab is active
+  // outside. Delivery / Takeaway ordering still works via the Tables card.
   const visibleTables = useMemo(() => {
-    const scoped =
-      serviceType && serviceType !== 'all'
-        ? filterTablesByServiceTypeWithFallback(tables, serviceType)
-        : tables;
+    const scoped = filterTablesByServiceType(tables, 'dine-in');
     return [...scoped].sort((a, b) => {
       const diff = statusPriority(a) - statusPriority(b);
       if (diff !== 0) return diff;
@@ -120,22 +118,15 @@ export function FloorPlanGrid({
         sensitivity: 'base',
       });
     });
-  }, [tables, serviceType]);
+  }, [tables]);
 
-  // Group by section (Indoor / Outdoor / Roof / Cabin / Hall / Garden /
-  // Pool / Room) so each dine-in area gets its own heading + row, matching
-  // the Tables card. Names resolve through the sections list — the hosted
-  // feed carries no nested section object. Delivery / Takeaway keep a single
-  // group under their own heading (their tables share one service meaning,
-  // not an area); Dine In groups by area like the unfiltered view.
+  // Dine-In only: always group by dining area (Indoor / Outdoor / Roof /
+  // Cabin / Hall / Garden / Pool / Room) so each area gets its own heading.
+  // Names resolve through the sections list — the hosted feed carries no
+  // nested section object.
   const groupedTables = useMemo<[string, Table[]][]>(
-    () => {
-      if (serviceType && serviceType !== 'all' && serviceType !== 'dine-in' && visibleTables.length > 0) {
-        return [[getServiceTypeLabel(serviceType), visibleTables]];
-      }
-      return groupTablesBySection(visibleTables, sections);
-    },
-    [visibleTables, sections, serviceType],
+    () => groupTablesBySection(visibleTables, sections),
+    [visibleTables, sections],
   );
 
   const counts = useMemo(() => {
@@ -144,8 +135,10 @@ export function FloorPlanGrid({
     return { reserved, free };
   }, [visibleTables]);
 
+  // Dine-in keeps compact tiles: 4 per row on phones so the floor plan
+  // fits one screen.
   const cellWidth = getResponsiveValue(
-    { xs: '48.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' },
+    { xs: '23.5%', sm: '18.8%', md: '15.6%', lg: '13.2%', xl: '11.2%' },
     breakpoint,
   ) as `${number}%`;
 
@@ -216,7 +209,7 @@ export function FloorPlanGrid({
                   <View style={styles.tileMeta}>
                     <MaterialCommunityIcons
                       name="seat"
-                      size={10}
+                      size={9}
                       color={reservedTile ? '#EDE9FE' : COLORS.muted}
                     />
                     <Text style={[styles.tileMetaText, { color: metaColor }]}>
@@ -228,12 +221,12 @@ export function FloorPlanGrid({
                         { color: reservedTile ? COLORS.white : color },
                       ]}
                     >
-                      {reservedTile ? 'Reserved' : 'Free'}
+                      {reservedTile ? 'Res.' : 'Free'}
                     </Text>
                   </View>
 
-                  <View style={styles.tileTags}>
-                    {reservationId && (
+                  {reservationId ? (
+                    <View style={styles.tileTags}>
                       <View
                         style={[
                           styles.tag,
@@ -242,12 +235,13 @@ export function FloorPlanGrid({
                       >
                         <Text
                           style={[styles.tagText, reservedTile && { color: darkPurple }]}
+                          numberOfLines={1}
                         >
                           {reservationId}
                         </Text>
                       </View>
-                    )}
-                  </View>
+                    </View>
+                  ) : null}
                 </Hoverable>
               </View>
             );
@@ -331,28 +325,28 @@ const styles = StyleSheet.create({
   grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    marginHorizontal: -4,
+    marginHorizontal: -3,
   },
   sectionGroup: {
-    marginBottom: 12,
-  },
-  sectionHeading: {
-    fontSize: 19,
-    fontWeight: '800',
-    color: '#0E5A6B',
     marginBottom: 8,
   },
+  sectionHeading: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0E5A6B',
+    marginBottom: 6,
+  },
   cell: {
-    paddingHorizontal: 4,
-    paddingBottom: 8,
+    paddingHorizontal: 3,
+    paddingBottom: 6,
   },
   tile: {
-    borderRadius: 12,
-    borderWidth: 1.5,
-    padding: 8,
-    minHeight: 78,
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 6,
+    minHeight: 56,
     justifyContent: 'space-between',
-    gap: 4,
+    gap: 2,
   },
   tileTop: {
     flexDirection: 'row',
@@ -360,24 +354,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   tileNumber: {
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: '900',
     color: COLORS.text,
     flex: 1,
   },
   statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
   },
   tileMeta: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 3,
+    gap: 2,
     flexWrap: 'wrap',
   },
   tileMetaText: {
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: '700',
     color: COLORS.muted,
     marginRight: 2,
@@ -385,7 +379,6 @@ const styles = StyleSheet.create({
   tileTags: {
     flexDirection: 'row',
     gap: 4,
-    minHeight: 16,
   },
   tag: {
     borderRadius: 5,

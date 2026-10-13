@@ -24,6 +24,7 @@ import Animated, { FadeIn, FadeOut, SlideInLeft, SlideOutLeft } from 'react-nati
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { TableTabIcon } from '@/components/TableTabIcon';
+import { FooterTabIcon } from '@/components/FooterTabIcon';
 import { api, Table, Section, Order, StaffUser, isReservedTable } from '@/services/api';
 import { homeApi } from '@/services/homeApi';
 import { orderApi } from '@/services/orderApi';
@@ -47,6 +48,7 @@ import { showBottomToast } from '@/components/BottomToast';
 import { subscribeMainTabSwitch, subscribeMainRefresh } from '@/utils/mainTab';
 import { resolveTableSectionName } from '@/utils/tableSections';
 import { isOpenOrder } from '@/utils/openValue';
+import { markBillRequested, isBillRequested, pruneBillRequested } from '@/utils/billRequested';
 import {
   assignReservationId,
   getReservationId,
@@ -132,11 +134,11 @@ export default function MainAppContainer() {
   const isWaiter = user?.role === 'WAITER';
   const isAdmin = user?.role === 'ADMIN';
 
-  // Admin: everything. Waiter: same as admin (Dashboard, Home, Orders, Menu, Notifications).
+  // Admin: everything. Waiter: same as admin (Dashboard, Home, Orders, Menu).
   const visibleTabs: string[] = (() => {
-    if (isAdmin) return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
-    if (isWaiter) return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
-    return ['dashboard', 'home', 'orders', 'menu', 'notifications'];
+    if (isAdmin) return ['dashboard', 'home', 'orders', 'menu'];
+    if (isWaiter) return ['dashboard', 'home', 'orders', 'menu'];
+    return ['dashboard', 'home', 'orders', 'menu'];
   })();
 
   // ── Side Drawer (absolute overlay — never squeezes the main column) ──
@@ -433,7 +435,15 @@ export default function MainAppContainer() {
         setTables(next);
       }
       if (activeOrdersRes.success && activeOrdersRes.data) {
-        setActiveOrders(activeOrdersRes.data);
+        // Bill-requested orders are checked out: hide them (and their table
+        // card) from the Order Details list even if the server still returns
+        // the rows until payment.
+        const baseUrl = api.getBaseUrl();
+        const visible = activeOrdersRes.data.filter(
+          (o) => !o.billRequested && !isBillRequested(o.id, baseUrl),
+        );
+        pruneBillRequested(activeOrdersRes.data.map((o) => o.id), baseUrl);
+        setActiveOrders(visible);
       }
 
       if (realFailures.length > 0) {
@@ -610,7 +620,12 @@ export default function MainAppContainer() {
         return;
       }
       if (res.success && res.data) {
-        setActiveOrders(res.data);
+        const baseUrl = api.getBaseUrl();
+        const visible = res.data.filter(
+          (o) => !o.billRequested && !isBillRequested(o.id, baseUrl),
+        );
+        pruneBillRequested(res.data.map((o) => o.id), baseUrl);
+        setActiveOrders(visible);
       }
     };
 
@@ -648,6 +663,7 @@ export default function MainAppContainer() {
           }
           if (event.payload?.billRequested === true) {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
+            markBillRequested(event.payload.orderId, api.getBaseUrl());
           }
           schedule('orders+tables', refetchOrdersAndTables);
           break;
@@ -660,6 +676,7 @@ export default function MainAppContainer() {
           }
           if (event.payload?.type === 'bill_requested') {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
+            markBillRequested(event.payload.orderId, api.getBaseUrl());
           }
           schedule('notifications', refreshNotifications);
           break;
@@ -1400,7 +1417,7 @@ export default function MainAppContainer() {
       <View style={styles.bottomTabBar}>
         {visibleTabs.includes('dashboard') && (
           <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('dashboard'); }} hoverOpacity={0.7}>
-            <MaterialCommunityIcons name="view-dashboard" size={activeTab === 'dashboard' ? 28 : 24} color={activeTab === 'dashboard' ? BRAND_PRIMARY : TEXT_MUTED} />
+            <FooterTabIcon name="view-dashboard" active={activeTab === 'dashboard'} size={activeTab === 'dashboard' ? 28 : 24} color={activeTab === 'dashboard' ? BRAND_PRIMARY : TEXT_MUTED} />
             <Text style={[styles.tabBtnText, activeTab === 'dashboard' && styles.tabBtnTextActive]}>Dashboard</Text>
           </Hoverable>
         )}
@@ -1410,10 +1427,16 @@ export default function MainAppContainer() {
             <Text style={[styles.tabBtnText, activeTab === 'home' && styles.tabBtnTextActive]}>My Tables</Text>
           </Hoverable>
         )}
+        {visibleTabs.includes('menu') && (
+          <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('menu'); }} hoverOpacity={0.7}>
+            <FooterTabIcon name="silverware-fork-knife" active={activeTab === 'menu'} size={activeTab === 'menu' ? 28 : 24} color={activeTab === 'menu' ? BRAND_PRIMARY : TEXT_MUTED} />
+            <Text style={[styles.tabBtnText, activeTab === 'menu' && styles.tabBtnTextActive]}>Menu</Text>
+          </Hoverable>
+        )}
         {visibleTabs.includes('orders') && (
           <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('orders'); }} hoverOpacity={0.7}>
             <View style={styles.tabIconWrapper}>
-              <MaterialCommunityIcons name="receipt" size={activeTab === 'orders' ? 28 : 24} color={activeTab === 'orders' ? BRAND_PRIMARY : TEXT_MUTED} />
+              <FooterTabIcon name="receipt" active={activeTab === 'orders'} size={activeTab === 'orders' ? 28 : 24} color={activeTab === 'orders' ? BRAND_PRIMARY : TEXT_MUTED} />
               {activeOrders.length > 0 && (
                 <View style={styles.tabBadge}>
                   <Text style={styles.tabBadgeText}>{activeOrders.length > 99 ? '99+' : activeOrders.length}</Text>
@@ -1423,33 +1446,6 @@ export default function MainAppContainer() {
             <Text style={[styles.tabBtnText, activeTab === 'orders' && styles.tabBtnTextActive]}>Order Details</Text>
           </Hoverable>
         )}
-        {visibleTabs.includes('menu') && (
-          <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('menu'); }} hoverOpacity={0.7}>
-            <MaterialCommunityIcons name="silverware-fork-knife" size={activeTab === 'menu' ? 28 : 24} color={activeTab === 'menu' ? BRAND_PRIMARY : TEXT_MUTED} />
-            <Text style={[styles.tabBtnText, activeTab === 'menu' && styles.tabBtnTextActive]}>Menu</Text>
-          </Hoverable>
-        )}
-        {visibleTabs.includes('notifications') && (
-          <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('notifications'); }} hoverOpacity={0.7}>
-            <View style={styles.tabIconWrapper}>
-              <MaterialCommunityIcons name="bell-ring" size={activeTab === 'notifications' ? 28 : 24} color={activeTab === 'notifications' ? BRAND_PRIMARY : TEXT_MUTED} />
-              {unreadCount > 0 && (
-                <View style={styles.tabBadge}>
-                  <Text style={styles.tabBadgeText}>{unreadCount > 99 ? '99+' : unreadCount}</Text>
-                </View>
-              )}
-            </View>
-            <Text style={[styles.tabBtnText, activeTab === 'notifications' && styles.tabBtnTextActive]}>Alerts</Text>
-          </Hoverable>
-        )}
-        <Hoverable style={styles.tabBtn} onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('profile'); }} hoverOpacity={0.7}>
-          <Image
-            source={require('../../assets/images/profile.jpg')}
-            style={[styles.tabProfileAvatar, activeTab === 'profile' && styles.tabProfileAvatarActive]}
-            resizeMode="contain"
-          />
-          <Text style={[styles.tabBtnText, activeTab === 'profile' && styles.tabBtnTextActive]}>Profile</Text>
-        </Hoverable>
       </View>
       </View>
       </View>

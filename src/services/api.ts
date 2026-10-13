@@ -24,6 +24,14 @@ import {
 import type { RemoteCafeTable, RemoteCustomer, RemoteTableCategory } from '@/utils/productionFeeds';
 import type { NotificationListResponse } from '@/utils/notifications';
 import {
+  addOfflineOrder,
+  getOfflineOrders,
+  getOfflineOrdersForTable,
+  isOfflineOrderId,
+  removeOfflineOrders,
+  updateOfflineOrder,
+} from '@/utils/offlineOrders';
+import {
   alternateSchemeUrl,
   describeLoopbackIssue,
   getBaseUrl,
@@ -1050,7 +1058,19 @@ class ApiService {
   async getTables(sectionId?: number): Promise<ApiResponse<Table[]>> {
     const res = await this.requestFeed<Table[]>('tables', '/tables');
     if (res.success && res.data) return this.serveTables(res.data, sectionId);
-    if (!this.canFallback(res)) return res;
+    if (!this.canFallback(res)) {
+      // Offline (status 0): serve the last floor-plan snapshot so the
+      // order pad can still open without any API.
+      if (res.status === 0 && !res.aborted) {
+        const cached = this.readCachedTables();
+        if (cached) {
+          const rows = applyLocalStatusOverrides(this.baseUrl, cached);
+          const filtered = sectionId ? rows.filter((t) => t.sectionId === sectionId) : rows;
+          return { success: true, data: filtered, status: 0 };
+        }
+      }
+      return res;
+    }
 
     const feed = await this.requestFeed<RemoteCafeTable[]>('cafetable', '/cafetable/all');
     if (feed.success && feed.data) {
@@ -1060,7 +1080,28 @@ class ApiService {
     // Both routes failed — surface whichever explains the situation: the feed
     // error when /tables is simply not implemented here, the /tables error
     // when it is (a 500 must not be blamed on a route that never existed).
+    // Offline with a snapshot: still let the app work from cache.
+    if ((res.status === 0 || feed.status === 0) && !res.aborted) {
+      const cached = this.readCachedTables();
+      if (cached) {
+        const rows = applyLocalStatusOverrides(this.baseUrl, cached);
+        const filtered = sectionId ? rows.filter((t) => t.sectionId === sectionId) : rows;
+        return { success: true, data: filtered, status: 0 };
+      }
+    }
     return this.hasRouteMiss('tables') ? feedFailure<Table[]>(feed) : res;
+  }
+
+  /** Last floor-plan snapshot serveTables persisted (offline fallback). */
+  private readCachedTables(): Table[] | null {
+    try {
+      const raw = getStorageItemSync(TABLES_CACHE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Table[];
+      return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1102,17 +1143,53 @@ class ApiService {
         is_reserved: isReservedTable(res.data as Table),
       };
       const overlaid = applyLocalStatusOverrides(this.baseUrl, [normalized])[0];
-      return overlaid === normalized ? { ...res, data: normalized } : { ...res, data: overlaid };
+      const base = (
+        overlaid === normalized ? { ...res, data: normalized } : { ...res, data: overlaid }
+      ) as ApiResponse<TableDetail>;
+      // Offline rows saved on this device belong to this table too.
+      const offline = getOfflineOrdersForTable(this.baseUrl, id).filter(
+        (o) => o.status !== 'CANCELLED' && o.paymentStatus !== 'PAID',
+      );
+      if (offline.length > 0) {
+        const existing = [...(base.data?.orders || []), ...(base.data?.activeOrders || [])];
+        const ids = new Set(existing.map((o) => o.id));
+        const merged = [...existing, ...offline.filter((o) => !ids.has(o.id))];
+        return { ...base, data: { ...(base.data as TableDetail), orders: merged, activeOrders: merged } };
+      }
+      return base;
     }
     if (!this.canFallback(res)) return res;
 
     // Hosted server: table detail is a row of the cafetable feed. It carries
     // no orders, so the detail comes back with an empty bill — enough for the
     // order screens to render their "nothing here yet" state.
+    // Offline orders saved on this device are merged in, so placing an order
+    // without any order API still shows up here.
     const tables = await this.getTables();
     const found = tables.success ? tables.data?.find((t) => t.id === id) : undefined;
-    if (!found) return res;
-    return { success: true, data: { ...found, orders: [], activeOrders: [] }, status: res.status };
+    const offline = getOfflineOrdersForTable(this.baseUrl, id).filter(
+      (o) => o.status !== 'CANCELLED' && o.paymentStatus !== 'PAID',
+    );
+    if (!found) {
+      // Fully offline with no snapshot — still open the pad when local orders
+      // exist, otherwise report the real failure.
+      if (offline.length > 0) {
+        const placeholder = {
+          id,
+          sectionId: 0,
+          tableNumber: this.resolveTableName(id),
+          capacity: 4,
+          status: 'AVAILABLE',
+        } as Table;
+        return {
+          success: true,
+          status: res.status,
+          data: { ...placeholder, orders: offline, activeOrders: offline },
+        };
+      }
+      return res;
+    }
+    return { success: true, data: { ...found, orders: offline, activeOrders: offline }, status: res.status };
   }
 
   /**
@@ -1332,7 +1409,24 @@ class ApiService {
     if (params?.dateFrom) query.set('dateFrom', params.dateFrom);
     if (params?.dateTo) query.set('dateTo', params.dateTo);
     const res = await this.request<{ orders: Order[]; page: number; limit: number; total: number; hasMore: boolean }>(`/orders?${query.toString()}`);
-    if (res.success) return res;
+    if (res.success && res.data) {
+      const offline = getOfflineOrders(this.baseUrl);
+      if (offline.length > 0) {
+        const ids = new Set(res.data.orders.map((o) => o.id));
+        const extra = offline.filter((o) => !ids.has(o.id));
+        if (extra.length > 0) {
+          return {
+            ...res,
+            data: {
+              ...res.data,
+              orders: [...extra, ...res.data.orders],
+              total: res.data.total + extra.length,
+            },
+          };
+        }
+      }
+      return res;
+    }
 
     // api.txt documents no order-list route — servers without one still have
     // GET /orders/active, so history/dashboard screens degrade to "what is
@@ -1359,16 +1453,51 @@ class ApiService {
 
   async getActiveOrders(requestKey?: string) {
     const response = await this.request<Order[]>('/orders/active', { requestKey: requestKey || 'active-orders' });
+    const offline = getOfflineOrders(this.baseUrl);
     if (response.success && response.data) {
-      this.saveCachedActiveOrders(response.data);
+      const ids = new Set(response.data.map((o) => o.id));
+      const merged = [...offline.filter((o) => !ids.has(o.id)), ...response.data];
+      this.saveCachedActiveOrders(merged);
+      return { ...response, data: merged };
+    }
+    // No order API on this server, or the device is offline: serve what this
+    // device saved (offline rows + last server snapshot) instead of an empty
+    // screen. A real server error (500) or auth failure still surfaces as-is.
+    if (!response.aborted && (response.status === 0 || isRouteMissing(response))) {
+      const cached = this.getCachedActiveOrders().filter((o) => !isOfflineOrderId(o.id));
+      const ids = new Set<number>();
+      const merged = [...offline, ...cached].filter((o) => (ids.has(o.id) ? false : (ids.add(o.id), true)));
+      if (merged.length > 0) {
+        return { success: true, data: merged, status: response.status };
+      }
+      if (offline.length > 0) {
+        return { success: true, data: offline, status: response.status };
+      }
     }
     return response;
   }
 
   async getOrder(id: number) {
-    return this.request<Order>(`/orders/${id}`);
+    if (isOfflineOrderId(id)) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === id);
+      if (found) return { success: true, data: found, status: 200 } as ApiResponse<Order>;
+      return { success: false, error: 'Order not found on this device', status: 404 } as ApiResponse<Order>;
+    }
+    const res = await this.request<Order>(`/orders/${id}`);
+    if (!res.success && (res.status === 0 || isRouteMissing(res))) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === id);
+      if (found) return { success: true, data: found, status: res.status } as ApiResponse<Order>;
+    }
+    return res;
   }
 
+  /**
+   * Place an order. When the server has no order API (route missing) or the
+   * device is offline (status 0), the order is saved on this device and
+   * returned as success — the waiter can keep serving and print the bill
+   * without any API. Server errors (400/500) and auth failures still fail
+   * honestly: only "no route / no connection" falls back.
+   */
   async createOrder(data: {
     tableId: number;
     waiterId?: number;
@@ -1384,11 +1513,71 @@ class ApiService {
     if (res.success && res.data) {
       const cached = this.getCachedActiveOrders();
       this.saveCachedActiveOrders([res.data, ...cached.filter((order) => order.id !== res.data!.id)]);
+      return res;
+    }
+    if (!res.aborted && (res.status === 0 || isRouteMissing(res))) {
+      const local = this.buildOfflineOrder(data);
+      addOfflineOrder(this.baseUrl, local);
+      const cached = this.getCachedActiveOrders();
+      this.saveCachedActiveOrders([local, ...cached.filter((order) => order.id !== local.id)]);
+      return { success: true, data: local, status: res.status };
     }
     return res;
   }
 
+  /**
+   * Build the device-local order saved when no order API is reachable. Prices
+   * come from the cart payload (already resolved against the cached menu by
+   * the order screen), so the totals match what the waiter saw.
+   */
+  private buildOfflineOrder(data: {
+    tableId: number;
+    waiterId?: number;
+    customerId?: number;
+    customerNotes?: string;
+    clientRequestId?: string;
+    items: { menuItemId: number; quantity: number; price: number; notes?: string }[];
+  }): Order {
+    const now = new Date().toISOString();
+    const total = data.items.reduce((sum, it) => sum + Number(it.price || 0) * Number(it.quantity || 0), 0);
+    return {
+      id: Date.now(),
+      tableId: data.tableId,
+      waiterId: data.waiterId ?? 0,
+      status: 'PENDING',
+      paymentStatus: 'UNPAID',
+      customerNotes: data.customerNotes ?? null,
+      subtotal: total,
+      totalAmount: total,
+      createdAt: now,
+      updatedAt: now,
+      table: { id: data.tableId, tableNumber: this.resolveTableName(data.tableId) } as Table,
+      items: data.items.map((it, idx) => ({
+        id: Date.now() + idx + 1,
+        menuItemId: it.menuItemId,
+        quantity: it.quantity,
+        price: Number(it.price),
+        notes: it.notes ?? null,
+        menuItem: {
+          id: it.menuItemId,
+          name: this.resolveMenuItemName(it.menuItemId),
+        } as MenuItem,
+      })),
+    } as Order;
+  }
+
   async updateOrderStatus(id: number, status: string) {
+    if (isOfflineOrderId(id)) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === id);
+      if (!found) return { success: false, error: 'Order not found on this device', status: 404 } as ApiResponse<Order>;
+      const next = { ...found, status: status as Order['status'], updatedAt: new Date().toISOString() };
+      updateOfflineOrder(this.baseUrl, next);
+      const cached = this.getCachedActiveOrders();
+      this.saveCachedActiveOrders(status === 'COMPLETED'
+        ? cached.filter((order) => order.id !== id)
+        : cached.map((order) => order.id === id ? next : order));
+      return { success: true, data: next, status: 200 };
+    }
     const response = await this.request<Order>(`/orders/${id}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
@@ -1403,6 +1592,21 @@ class ApiService {
   }
 
   async cancelOrder(id: number, reason?: string) {
+    if (isOfflineOrderId(id)) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === id);
+      if (!found) return { success: false, error: 'Order not found on this device', status: 404 } as ApiResponse<Order>;
+      const next = {
+        ...found,
+        status: 'CANCELLED',
+        cancelReason: reason ?? null,
+        cancelledAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as Order;
+      updateOfflineOrder(this.baseUrl, next);
+      const cached = this.getCachedActiveOrders();
+      this.saveCachedActiveOrders(cached.map((order) => order.id === id ? next : order));
+      return { success: true, data: next, status: 200 };
+    }
     let response = await this.request<Order>(`/orders/${id}/cancel`, {
       method: 'POST',
       body: JSON.stringify({ reason }),
@@ -1423,12 +1627,43 @@ class ApiService {
   }
 
   async requestBill(orderId: number) {
-    return this.request<Order>(`/orders/${orderId}/request-bill`, {
+    if (isOfflineOrderId(orderId)) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === orderId);
+      if (!found) return { success: false, error: 'Order not found on this device', status: 404 } as ApiResponse<Order>;
+      const next = { ...found, billRequested: true, updatedAt: new Date().toISOString() };
+      updateOfflineOrder(this.baseUrl, next);
+      return { success: true, data: next, status: 200 };
+    }
+    const res = await this.request<Order>(`/orders/${orderId}/request-bill`, {
       method: 'POST',
     });
+    // No bill route on this server (or offline) but the order is device-local:
+    // record the request locally instead of failing.
+    if (!res.success && !res.aborted && (res.status === 0 || isRouteMissing(res))) {
+      const found = getOfflineOrders(this.baseUrl).find((o) => o.id === orderId);
+      if (found) {
+        const next = { ...found, billRequested: true, updatedAt: new Date().toISOString() };
+        updateOfflineOrder(this.baseUrl, next);
+        return { success: true, data: next, status: res.status };
+      }
+    }
+    return res;
   }
 
   async printBill(orderId: number) {
+    // Device-local orders have no server print route — the web receipt in
+    // print.ts still goes out, so report success for offline ids.
+    if (isOfflineOrderId(orderId)) {
+      return {
+        success: true,
+        data: {
+          message: 'Saved on this device',
+          orderId,
+          printer: { configured: false, host: null, port: 0, queueLength: 0, nextJobId: 0 },
+        },
+        status: 200,
+      };
+    }
     return this.request<{ message: string; orderId: number; printer: { configured: boolean; host: string | null; port: number; queueLength: number; nextJobId: number } }>(`/orders/${orderId}/print`, {
       method: 'POST',
     });
@@ -1456,11 +1691,47 @@ class ApiService {
     paymentMethod: PaymentMethod;
     amountPaid: number;
   }): Promise<ApiResponse<CheckoutResult>> {
+    const offlineIds = payload.orderIds.filter((id) => isOfflineOrderId(id));
+    const serverIds = payload.orderIds.filter((id) => !isOfflineOrderId(id));
+    // All ids are device-local (or the checkout route is unreachable): settle
+    // locally — drop the rows so the table reads as free.
+    if (offlineIds.length > 0 && serverIds.length === 0) {
+      const res = await this.request<CheckoutResult>('/cashier/checkout', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.success) {
+        removeOfflineOrders(this.baseUrl, offlineIds);
+        const cached = this.getCachedActiveOrders();
+        this.saveCachedActiveOrders(cached.filter((o) => !offlineIds.includes(o.id)));
+        removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
+        return res;
+      }
+      // Server could not settle (no route / offline) — local settlement still
+      // succeeds so the waiter is never stuck at the counter.
+      if (!res.aborted && (res.status === 0 || isRouteMissing(res))) {
+        removeOfflineOrders(this.baseUrl, offlineIds);
+        const cached = this.getCachedActiveOrders();
+        this.saveCachedActiveOrders(cached.filter((o) => !offlineIds.includes(o.id)));
+        return {
+          success: true,
+          status: res.status,
+          data: {
+            payment: { id: Date.now(), method: payload.paymentMethod, status: 'SUCCESS', amount: payload.amountPaid },
+            orders: offlineIds.map((id) => ({ id, paymentStatus: 'PAID', status: 'COMPLETED' })),
+            message: 'Settled on this device (offline)',
+          },
+        };
+      }
+      // A real server rejection keeps the local rows — surface the error.
+      return res;
+    }
     const res = await this.request<CheckoutResult>('/cashier/checkout', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
     if (res.success) {
+      if (offlineIds.length > 0) removeOfflineOrders(this.baseUrl, offlineIds);
       removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
     }
     return res;

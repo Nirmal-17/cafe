@@ -17,6 +17,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Hoverable } from '@/components/Hoverable';
 import { api, MenuItem, MenuCategory, isRouteMissing } from '@/services/api';
 import { orderApi } from '@/services/orderApi';
+import { isOfflineOrderId } from '@/utils/offlineOrders';
 import { loadSession } from '@/utils/sessions';
 import { useResponsive, getSpacing, getFontSize, getBorderRadius, getIconSize, moderateScale, getResponsiveValue, getGridGap } from '@/utils/responsive';
 import { webAlert } from '@/utils/webAlert';
@@ -59,6 +60,7 @@ export default function PlaceOrderScreen() {
 
   const [selectedItems, setSelectedItems] = useState<Map<number, { item: MenuItem; quantity: number }>>(new Map());
   const [submitting, setSubmitting]       = useState(false);
+  const [offlineMode, setOfflineMode]     = useState(false);
   const [kitchenNotes, setKitchenNotes]   = useState('');
   const [counterNotes, setCounterNotes]   = useState('');
   const [cashierNotes, setCashierNotes]   = useState('');
@@ -69,8 +71,25 @@ export default function PlaceOrderScreen() {
     try {
       setError(null);
       const { table: tableRes, menu: menuRes, settings: settingsRes } = await orderApi.getPlaceOrderData(Number(id));
-      if (tableRes.success && tableRes.data) setTable(tableRes.data);
-      else setError(tableRes.error || 'Failed to load table');
+      const menuOk = menuRes.success && menuRes.data;
+      if (tableRes.success && tableRes.data) {
+        setTable(tableRes.data);
+        setOfflineMode(tableRes.status === 0);
+      } else if (menuOk) {
+        // No table API (offline or read-only server) — still let the waiter
+        // take the order against the cached floor-plan name. The order itself
+        // is saved on this device (see handleSubmitOrder).
+        setTable({
+          id: Number(id),
+          sectionId: 0,
+          tableNumber: api.resolveTableName(Number(id)),
+          capacity: 4,
+          status: 'AVAILABLE',
+        });
+        setOfflineMode(true);
+      } else {
+        setError(tableRes.error || 'Failed to load table');
+      }
       if (menuRes.success && menuRes.data) {
         setMenu(menuRes.data);
         // Drop cart lines whose menu item no longer exists on the server
@@ -235,8 +254,33 @@ export default function PlaceOrderScreen() {
           switchMainTab('menu');
           router.dismissTo('/' as any);
         };
+        // "Yes, print bill" lands on the Dashboard (floor overview) — not
+        // the menu — so the waiter sees the updated table status next.
+        const goToDashboard = () => {
+          requestMainRefresh();
+          switchMainTab('dashboard');
+          router.dismissTo('/' as any);
+        };
         const createdOrder = response.data;
         const tableNumberForToast = table?.tableNumber;
+        const savedOffline = isOfflineOrderId((createdOrder as { id?: unknown })?.id);
+        if (savedOffline) {
+          webAlert('Order Saved (Offline)', 'No order API on this server — the order is saved on this device. You can still print the bill.', [
+            {
+              text: 'No',
+              style: 'cancel',
+              onPress: goToMenuItems,
+            },
+            {
+              text: 'Yes',
+              onPress: () => {
+                notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
+                goToDashboard();
+              },
+            },
+          ]);
+          return;
+        }
         webAlert('Print Bill', 'Do you want to print the bill?', [
           {
             text: 'No',
@@ -247,7 +291,7 @@ export default function PlaceOrderScreen() {
             text: 'Yes',
             onPress: () => {
               notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
-              goToMenuItems();
+              goToDashboard();
             },
           },
         ]);
@@ -355,6 +399,12 @@ export default function PlaceOrderScreen() {
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
+        {offlineMode ? (
+          <View style={styles.offlineBanner}>
+            <MaterialIcons name="cloud-off" size={16} color="#B45309" />
+            <Text style={styles.offlineBannerText}>Offline mode — orders are saved on this device without API</Text>
+          </View>
+        ) : null}
         {/* ─── Search Bar ─── */}
         <View style={styles.searchBar}>
           <MaterialIcons name="search" size={20} color="#64748B" />
@@ -430,7 +480,7 @@ export default function PlaceOrderScreen() {
                         )}
                         <Text style={styles.menuCardName} numberOfLines={2}>{item.name}</Text>
                         <View style={styles.menuCardFooter}>
-                          <Text style={styles.menuCardPrice} numberOfLines={1}>{currencySymbol} {Number(item.price).toFixed(2)}</Text>
+                          <Text style={styles.menuCardPrice} numberOfLines={1}>{Number(item.price).toFixed(2)}</Text>
                           <View style={styles.addBtn}><MaterialIcons name="add" size={16} color="#FFF" /></View>
                         </View>
                       </TouchableOpacity>
@@ -688,6 +738,8 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
   disabledBtn:    { opacity: 0.7 },
 
   stickyBar:      { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#F8FAFC', borderTopWidth: 1, borderTopColor: BORDER_COLOR, padding: getSpacing(bp.breakpoint, 'md'), zIndex: 10 },
+  offlineBanner:  { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#FFFBEB', borderWidth: 1, borderColor: '#FCD34D', borderRadius: getBorderRadius(bp.breakpoint, 'md'), paddingHorizontal: getSpacing(bp.breakpoint, 'md'), paddingVertical: getSpacing(bp.breakpoint, 'sm'), marginBottom: getSpacing(bp.breakpoint, 'sm') },
+  offlineBannerText: { flex: 1, fontSize: getFontSize(bp.breakpoint, 'xs'), fontWeight: '700', color: '#92400E' },
   stickySummary:  { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   summaryText:    { fontSize: getFontSize(bp.breakpoint, 'sm'), color: TEXT_MUTED },
   summaryAmount:  { fontSize: getFontSize(bp.breakpoint, 'sm'), color: BRAND_ORANGE },

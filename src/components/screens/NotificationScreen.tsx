@@ -16,6 +16,7 @@ import {
 } from '@/utils/notifications';
 import { webAlert } from '@/utils/webAlert';
 import { api } from '@/services/api';
+import { switchMainTab } from '@/utils/mainTab';
 
 // ─────────────────────────────────────────────
 // Brand / semantic colors
@@ -91,6 +92,17 @@ export function NotificationScreen({ notifications, unreadCount, onRefresh, onNa
   const handleNotificationPress = useCallback((item: StoredNotification) => {
     if (!item.read) {
       handleMarkAsRead(item.id);
+    }
+    // Bill-requested alert: OK lands on the Order Details list, where the
+    // billed table is already removed.
+    if (item.type === 'bill_requested' && item.tableId) {
+      webAlert(item.title, item.message, [{
+        text: 'OK',
+        onPress: () => {
+          switchMainTab('orders');
+        },
+      }]);
+      return;
     }
     webAlert(item.title, item.message, [{ text: 'OK' }]);
   }, [handleMarkAsRead]);

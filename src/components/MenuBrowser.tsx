@@ -71,11 +71,9 @@ const isSpicyItem = (item: MenuItem): boolean => {
 
 const MenuItemCard = memo(function MenuItemCard({
   entry,
-  currencySymbol,
   onPress,
 }: {
   entry: FlatMenuItem;
-  currencySymbol: string;
   onPress: (item: MenuItem, categoryName: string) => void;
 }) {
   const { item, categoryName } = entry;
@@ -123,7 +121,7 @@ const MenuItemCard = memo(function MenuItemCard({
       <View style={styles.itemCardRight}>
         <View style={styles.priceTag}>
           <Text style={styles.priceText}>
-            {currencySymbol} {Number(item.price).toFixed(2)}
+            {Number(item.price).toFixed(2)}
           </Text>
         </View>
         <MaterialIcons name="chevron-right" size={20} color={TEXT_MUTED} />
@@ -140,26 +138,12 @@ export const MenuBrowser = memo(function MenuBrowser({
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [currencySymbol, setCurrencySymbol] = useState<string>('NPR');
-
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [selectedItem, setSelectedItem] = useState<MenuItem | null>(null);
   const [selectedItemCategory, setSelectedItemCategory] = useState<string>('');
-
-  const fetchSettings = useCallback(async () => {
-    try {
-      const res = await api.getSettings();
-      if (res.success && res.data) {
-        const symbol = res.data.currencySymbol || 'NPR';
-        setCurrencySymbol(symbol === '$' ? 'NPR' : symbol);
-      }
-    } catch {
-      setCurrencySymbol('NPR');
-    }
-  }, []);
 
   useEffect(() => {
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
@@ -192,14 +176,14 @@ export const MenuBrowser = memo(function MenuBrowser({
     let active = true;
     const loadData = async () => {
       if (active) {
-        await Promise.all([fetchMenu(), fetchSettings()]);
+        await fetchMenu();
       }
     };
     loadData();
     return () => {
       active = false;
     };
-  }, [fetchMenu, fetchSettings]);
+  }, [fetchMenu]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -270,11 +254,10 @@ export const MenuBrowser = memo(function MenuBrowser({
     ({ item: entry }: { item: FlatMenuItem }) => (
       <MenuItemCard
         entry={entry}
-        currencySymbol={currencySymbol}
         onPress={handleCardPress}
       />
     ),
-    [currencySymbol, handleCardPress]
+    [handleCardPress]
   );
 
   const keyExtractor = useCallback((entry: FlatMenuItem, index: number) => {
@@ -497,7 +480,7 @@ export const MenuBrowser = memo(function MenuBrowser({
                   
                 </View>
                 <Text style={styles.modalHeroPrice}>
-                  {currencySymbol} {Number(selectedItem.price).toFixed(2)}
+                  {Number(selectedItem.price).toFixed(2)}
                 </Text>
               </LinearGradient>
 

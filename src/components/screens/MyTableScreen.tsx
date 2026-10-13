@@ -27,7 +27,7 @@ import {
   useReservationsRevision,
 } from '@/utils/reservations';
 import {
-  filterTablesByServiceTypeWithFallback,
+  filterTablesByServiceType,
   getServiceTypeLabel,
   ServiceType,
 } from '@/utils/diningArea';
@@ -236,9 +236,10 @@ export function MyTableScreen({
   const isFreeTable = useCallback((table: Table) => !isTableReserved(table), []);
 
   // Service-type slice (top Dine In / Delivery / Takeaway row).
+  // Strict filter: Delivery/Takeaway show ONLY their dedicated tables.
   // Backend section filter still applies underneath for compatibility.
   const serviceTables = useMemo(() => {
-    const byService = filterTablesByServiceTypeWithFallback(visibleTables, serviceFilter);
+    const byService = filterTablesByServiceType(visibleTables, serviceFilter);
     if (activeSectionId === null) return byService;
     return byService.filter(
       (table) => String(table.sectionId) === String(activeSectionId)

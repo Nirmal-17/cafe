@@ -1,14 +1,10 @@
 // Waiter dashboard floor-plan allowlist.
 //
 // The venue wants the waiter-logged-in dashboard to show ONLY:
-//   Indoor  → IN 1..IN 5
-//   Roof    → R 1..R 3
-//   Cabin   → C 1
-//   Hall    → Test 2, Test Hall
-//   Garden  → G 1..G 4
-//   Pool    → P 1..P 2
-//   Room    → Deluxe Room 1..5
-//   Outdoor → 01..06 (O1..O6 / Outdoor 1..6 / bare 01..06)
+//   Dine-in → IN 1..IN 5, R 1..R 3, C 1, Test 2 / Test Hall,
+//             G 1..G 4, P 1..P 2, Deluxe Room 1..5, Outdoor 01..06
+//   Delivery → D1..D10, Del 1..Del 3 (Delivery 1, D-1, …)
+//   Takeaway → T1..T8, Take 1..Take 4 (Takeaway 1, T-1, …)
 //
 // Everything else from the server (Indoor 1/2, Cabin 2, Hall 1..3,
 // Outdoor 1, Bar 1..4, …) is hidden — but ONLY on the waiter dashboard.
@@ -18,6 +14,7 @@
 // while "Indoor 1" does NOT (it has no IN-prefix + number shape).
 
 import type { Table } from '@/services/api';
+import { classifyTableServiceType } from '@/utils/diningArea';
 
 const flat = (v: unknown): string =>
   String(v ?? '')
@@ -32,9 +29,19 @@ const trailingNumber = (v: string): number | null => {
 };
 
 /** True when this table belongs in the waiter dashboard floor plan. */
-export function isWaiterDashboardTable(tableNumber: unknown): boolean {
+export function isWaiterDashboardTable(tableNumber: unknown, serviceType?: unknown): boolean {
+  // Explicit backend flag wins (e.g. mapped production feeds).
+  const st = String(serviceType ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (st === 'delivery' || st === 'takeaway') return true;
+
   const raw = String(tableNumber ?? '').trim();
   if (!raw) return false;
+
+  // Delivery (D1..D10, Del 1..3) + Takeaway (T1..T8, Take 1..4) always pass —
+  // otherwise the dashboard Delivery/Takeaway tabs render "No tables found".
+  // classifyTableServiceType already excludes lookalikes (Deluxe, Test).
+  if (classifyTableServiceType(raw) !== 'dine-in') return true;
+
   const v = raw.toLowerCase().trim();
   const f = flat(raw);
 
@@ -105,10 +112,10 @@ export function isWaiterDashboardTable(tableNumber: unknown): boolean {
 }
 
 /** Keep only the allowlisted tables (order preserved). */
-export function filterWaiterDashboardTables<T extends { tableNumber?: unknown }>(
+export function filterWaiterDashboardTables<T extends { tableNumber?: unknown; serviceType?: unknown }>(
   tables: readonly T[],
 ): T[] {
-  return tables.filter((t) => isWaiterDashboardTable(t.tableNumber));
+  return tables.filter((t) => isWaiterDashboardTable(t.tableNumber, (t as { serviceType?: unknown }).serviceType));
 }
 
 /** Type-safe helper for Table[] specifically. */

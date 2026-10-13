@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
-import { Text, View, StyleSheet, Modal, Pressable, TouchableOpacity } from 'react-native';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Text, View, StyleSheet, Modal, Pressable, ScrollView, TouchableOpacity } from 'react-native';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { Order, Section, Table, isReservedTable } from '@/services/api';
@@ -14,9 +14,9 @@ import {
   TABLE_STATUS_COLORS,
 } from './shared';
 import { useRouter } from 'expo-router';
-import { filterTablesByServiceType, getServiceTypeLabel, ServiceType } from '@/utils/diningArea';
+import { getServiceTypeLabel, ServiceType } from '@/utils/diningArea';
 
-type TableTab = 'ALL' | 'FREE' | 'RESERVED' | 'DINE-IN' | 'DELIVERY' | 'TAKEAWAY';
+type TableTab = string;
 
 interface TableTabsCardProps {
   tables: Table[];
@@ -29,26 +29,12 @@ interface TableTabsCardProps {
   serviceType?: ServiceType | 'all';
 }
 
-const TABS: { key: TableTab; label: string; color: string }[] = [
-  { key: 'ALL', label: 'All', color: COLORS.primary },
-  { key: 'FREE', label: 'Free', color: TABLE_STATUS_COLORS.AVAILABLE },
-  { key: 'RESERVED', label: 'Reserved', color: TABLE_STATUS_COLORS.RESERVED },
-];
-
-const SERVICE_TYPE_TABS: { key: TableTab; label: string; color: string }[] = [
-  { key: 'DINE-IN', label: 'Dine-in', color: '#16A34A' },
-  { key: 'DELIVERY', label: 'Delivery', color: '#F59E0B' },
-  { key: 'TAKEAWAY', label: 'Takeaway', color: '#EF4444' },
-];
+const ALL_TAB = 'ALL';
 
 const STATUS_LABELS: Record<string, string> = {
   AVAILABLE: 'Free',
   RESERVED: 'Reserved',
 };
-
-function getStatus(table: Table): string {
-  return isReservedTable(table) ? 'RESERVED' : 'AVAILABLE';
-}
 
 function tablePriority(table: Table): number {
   return isReservedTable(table) ? 1 : 2;
@@ -128,33 +114,56 @@ export function TableTabsCard({
     [tables],
   );
 
-  const counts = useMemo(
-    () => ({
-      all: visibleTables.length,
-      free: visibleTables.filter((t) => getStatus(t) === 'AVAILABLE').length,
-      reserved: visibleTables.filter((t) => isReservedTable(t)).length,
-      // Shared helper, so the counts match what each tab actually displays
-      // (Delivery/Takeaway fall back to the shared tables when empty).
-      dineIn: filterTablesByServiceType(visibleTables, 'dine-in').length,
-      delivery: filterTablesByServiceType(visibleTables, 'delivery').length,
-      takeaway: filterTablesByServiceType(visibleTables, 'takeaway').length,
-    }),
-    [visibleTables],
+  // Delivery / Takeaway share one service meaning (not areas) — same as
+  // My Tables, they keep a single group with no area filter tabs.
+  const isServiceView = serviceType === 'delivery' || serviceType === 'takeaway';
+
+  // Area filter tabs: All + every section present in the current list
+  // (Indoor, Roof, Cabin, Hall, Garden, Pool, Room, Outdoor…), in venue order.
+  const sectionNames = useMemo(
+    () =>
+      isServiceView
+        ? []
+        : groupTablesBySection(visibleTables, sections).map(([name]) => name),
+    [visibleTables, sections, isServiceView],
+  );
+
+  useEffect(() => {
+    if (tab !== ALL_TAB && !sectionNames.includes(tab)) setTab(ALL_TAB);
+  }, [sectionNames, tab]);
+
+  const counts = useMemo(() => {
+    const map = new Map<string, number>();
+    visibleTables.forEach((t) => {
+      const key = resolveTableSectionName(t, sections);
+      map.set(key, (map.get(key) ?? 0) + 1);
+    });
+    return map;
+  }, [visibleTables, sections]);
+
+  const sectionTabs = useMemo(
+    () => [
+      { key: ALL_TAB, label: 'All', count: visibleTables.length },
+      ...sectionNames.map((name) => ({
+        key: name,
+        label: name,
+        count: counts.get(name) ?? 0,
+      })),
+    ],
+    [sectionNames, counts, visibleTables.length],
   );
 
   const tabTables = useMemo(() => {
-    if (tab === 'FREE') return visibleTables.filter((t) => getStatus(t) === 'AVAILABLE');
-    if (tab === 'RESERVED') return visibleTables.filter((t) => isReservedTable(t));
-    if (tab === 'DINE-IN' || tab === 'DELIVERY' || tab === 'TAKEAWAY') {
-      const want: ServiceType =
-        tab === 'DINE-IN' ? 'dine-in' : tab === 'DELIVERY' ? 'delivery' : 'takeaway';
-      return filterTablesByServiceType(visibleTables, want);
-    }
-    return visibleTables;
-  }, [visibleTables, tab]);
+    if (tab === ALL_TAB) return visibleTables;
+    return visibleTables.filter((t) => resolveTableSectionName(t, sections) === tab);
+  }, [visibleTables, tab, sections]);
 
+  // Service views (Delivery / Takeaway) match My Tables: 3 per row on
+  // phones, like the screenshot (D1..D10, Del 1..3).
   const cellWidth = getResponsiveValue(
-    { xs: '48.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' },
+    isServiceView
+      ? { xs: '31.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' }
+      : { xs: '48.5%', sm: '31.5%', md: '23.5%', lg: '18.8%', xl: '15.6%' },
     breakpoint,
   ) as `${number}%`;
 
@@ -172,13 +181,8 @@ export function TableTabsCard({
   // selected. Matches FloorPlanGrid's outer-filter grouping.
   const groupedTables = useMemo<[string, Table[]][]>(
     () => {
-      if (tab === 'DELIVERY' || tab === 'TAKEAWAY') {
-        return tabTables.length > 0
-          ? [[getServiceTypeLabel(tab.toLowerCase()), tabTables]]
-          : [];
-      }
       if (
-        (tab === 'ALL' || tab === 'FREE' || tab === 'RESERVED') &&
+        tab === ALL_TAB &&
         (serviceType === 'delivery' || serviceType === 'takeaway')
       ) {
         return tabTables.length > 0
@@ -190,21 +194,9 @@ export function TableTabsCard({
     [tabTables, sections, tab, serviceType],
   );
 
-  const tabColor =
-    [...TABS, ...SERVICE_TYPE_TABS].find((t) => t.key === tab)?.color || COLORS.primary;
+  const tabColor = COLORS.primary;
 
-  const emptyText =
-    tab === 'FREE'
-      ? 'No free tables right now'
-      : tab === 'RESERVED'
-        ? 'No reserved tables'
-        : tab === 'DINE-IN'
-          ? 'No dine-in tables'
-          : tab === 'DELIVERY'
-            ? 'No delivery tables'
-            : tab === 'TAKEAWAY'
-              ? 'No takeaway tables'
-              : 'No tables found';
+  const emptyText = 'No tables found';
 
   return (
     <>
@@ -217,27 +209,26 @@ export function TableTabsCard({
         actionLabel="See all"
         onAction={onSeeAll}
       >
-        {/* TABS: ALL / FREE / RESERVED */}
-        <View style={styles.tabsRow}>
-          {TABS.map((item) => {
+        {/* TABS: All + area filters (Indoor, Roof, Cabin, Hall…), horizontally scrollable */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.tabsRow}
+          style={styles.tabsScroll}
+        >
+          {sectionTabs.map((item) => {
             const isActive = tab === item.key;
             const isHovered = hoveredTab === item.key;
             const highlighted = isActive || isHovered;
-            const count =
-              item.key === 'ALL'
-              ? counts.all
-              : item.key === 'FREE'
-                ? counts.free
-                : counts.reserved;
 
           return (
             <Hoverable
               key={item.key}
               style={[
                 styles.tab,
-                highlighted && { backgroundColor: item.color, borderColor: item.color },
+                highlighted && { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
               ]}
-              hoverStyle={{ backgroundColor: item.color, borderColor: item.color }}
+              hoverStyle={{ backgroundColor: COLORS.primary, borderColor: COLORS.primary }}
               onPress={() => setTab(item.key)}
               onHoverIn={() => setHoveredTab(item.key)}
               onHoverOut={() => setHoveredTab((cur) => (cur === item.key ? null : cur))}
@@ -246,48 +237,12 @@ export function TableTabsCard({
               accessibilityState={{ selected: isActive }}
             >
               <Text style={[styles.tabText, highlighted && styles.tabTextActive]}>
-                {item.label} ({count})
+                {item.label} ({item.count})
               </Text>
             </Hoverable>
           );
         })}
-        </View>
-
-        {/* SERVICE TYPE: DINE-IN / DELIVERY / TAKEAWAY */}
-        <View style={styles.tabsRow}>
-          {SERVICE_TYPE_TABS.map((item) => {
-            const isActive = tab === item.key;
-            const isHovered = hoveredTab === item.key;
-            const highlighted = isActive || isHovered;
-            const count =
-              item.key === 'DINE-IN'
-                ? counts.dineIn
-                : item.key === 'DELIVERY'
-                  ? counts.delivery
-                  : counts.takeaway;
-
-          return (
-            <Hoverable
-              key={item.key}
-              style={[
-                styles.tab,
-                highlighted && { backgroundColor: item.color, borderColor: item.color },
-              ]}
-              hoverStyle={{ backgroundColor: item.color, borderColor: item.color }}
-              onPress={() => setTab(isActive ? 'ALL' : item.key)}
-              onHoverIn={() => setHoveredTab(item.key)}
-              onHoverOut={() => setHoveredTab((cur) => (cur === item.key ? null : cur))}
-              hoverOpacity={1}
-              accessibilityRole="button"
-              accessibilityState={{ selected: isActive }}
-            >
-              <Text style={[styles.tabText, highlighted && styles.tabTextActive]}>
-                {item.label} ({count})
-              </Text>
-            </Hoverable>
-          );
-        })}
-      </View>
+        </ScrollView>
 
       {tabTables.length === 0 ? (
         <View style={styles.emptyState}>
@@ -397,12 +352,15 @@ export function TableTabsCard({
 }
 
 const styles = StyleSheet.create({
-  /* Tabs */
+  /* Tabs — horizontally scrollable area filters */
+  tabsScroll: {
+    marginBottom: 10,
+  },
   tabsRow: {
     flexDirection: 'row',
     gap: 8,
-    marginBottom: 10,
-    flexWrap: 'wrap',
+    alignItems: 'center',
+    paddingRight: 8,
   },
   tab: {
     height: 30,

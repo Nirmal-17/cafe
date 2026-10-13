@@ -8,6 +8,8 @@ import { AlertDialog } from '@/components/AlertDialog';
 import { BottomToast } from '@/components/BottomToast';
 import { useEffect, useRef, useState } from 'react';
 import { api, TABLE_STATUS_OVERRIDES_KEY } from '@/services/api';
+import { OFFLINE_ORDERS_KEY } from '@/utils/offlineOrders';
+import { BILL_REQUESTED_KEY } from '@/utils/billRequested';
 import { BASE_URL_STORAGE_KEY } from '@/config/apiConfig';
 import { getStorageItemSync, initStorageHydration } from '@/utils/storage';
 import { loadSession } from '@/utils/sessions';
@@ -37,6 +39,11 @@ const PERSISTED_KEYS = [
   // Reservation codes must survive a restart or a booked table would lose
   // its RES-#### id on the next launch.
   RESERVATIONS_STORAGE_KEY,
+  // Device-saved orders (placed with no order API) must survive a restart.
+  OFFLINE_ORDERS_KEY,
+  // Bill-requested order ids must survive a restart or the table would
+  // reappear in the Order Details list on the next launch.
+  BILL_REQUESTED_KEY,
 ];
 
 export default function Layout() {

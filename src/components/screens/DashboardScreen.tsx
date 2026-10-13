@@ -19,9 +19,9 @@ import {
   isIndoor,
   isOutdoor,
   getDiningAreaLabel,
-  filterTablesByServiceTypeWithFallback,
+  filterTablesByServiceType,
 } from '@/utils/diningArea';
-import { COLORS, SectionCard, formatMoney } from '@/components/dashboard/shared';
+import { COLORS, formatMoney } from '@/components/dashboard/shared';
 import { DashboardKpi, KpiGrid } from '@/components/dashboard/KpiGrid';
 import { OrderActionList } from '@/components/dashboard/ActionQueue';
 import { FloorPlanGrid } from '@/components/dashboard/FloorPlanGrid';
@@ -152,7 +152,9 @@ export function DashboardScreen({
   }, [activeOrders, loadExtras]);
 
   // ── Waiter dashboard shows ONLY the venue allowlist (IN 1-5, R 1-3,
-  // C 1, Test 2 / Test Hall, G 1-4, P 1-2, Deluxe Room 1-5, Outdoor 01-06).
+  // C 1, Test 2 / Test Hall, G 1-4, P 1-2, Deluxe Room 1-5, Outdoor 01-06)
+  // PLUS every Delivery (D1..D10, Del 1..3) + Takeaway (T1..T8, Take 1..4)
+  // table, so the Delivery/Takeaway tabs never render empty.
   // Admin dashboard + My Tables keep the full server list.
   const displayTables = useMemo(
     () => (isWaiter ? filterWaiterDashboardTables(tables) : tables),
@@ -168,14 +170,6 @@ export function DashboardScreen({
   }, [displayTables]);
 
   const activeOrderCount = activeOrders.length;
-
-  const billRequests = useMemo(
-    () =>
-      activeOrders
-        .filter((o) => o.billRequested && o.paymentStatus !== 'PAID')
-        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()),
-    [activeOrders],
-  );
 
   const readyOrders = useMemo(
     () =>
@@ -214,9 +208,10 @@ export function DashboardScreen({
   );
 
   const filteredTables = useMemo(() => {
-    // Outer-level helper: Delivery/Takeaway fall back to the shared tables
-    // only when no dedicated Del*/Take* tables exist at all.
-    return filterTablesByServiceTypeWithFallback(displayTables, activeSection);
+    // Strict service-type filter: Delivery shows ONLY delivery tables
+    // (Del*/D*), Takeaway ONLY takeaway tables (Take*/T*). No fallback to
+    // other tables — an empty result renders the empty state instead.
+    return filterTablesByServiceType(displayTables, activeSection);
   }, [displayTables, activeSection]);
 
   const sectionLabels = useMemo(() => {
@@ -399,19 +394,6 @@ export function DashboardScreen({
           serviceType={activeSection}
         />
 
-        {/* BILL REQUESTS — most urgent waiter action */}
-        {billRequests.length > 0 && (
-          <OrderActionList
-            title="Bill Requests"
-            icon="cash-register"
-            color={COLORS.amber}
-            orders={billRequests}
-            getElapsed={getElapsedDiningTime}
-            onOrderPress={openOrder}
-            onViewAll={() => onNavigateToTab('orders')}
-          />
-        )}
-
         {/* READY TO SERVE — one-tap Mark Served */}
         {readyOrders.length > 0 && (
           <OrderActionList
@@ -444,46 +426,16 @@ export function DashboardScreen({
           />
         )}
 
-        {/* FLOOR PLAN — same for waiter and admin */}
+        {/* FLOOR PLAN — Dine-In only (ignores the Delivery/Takeaway tab):
+            always the physical restaurant layout. Delivery/Takeaway ordering
+            stays on the Tables card above. */}
         <FloorPlanGrid
-          tables={filteredTables}
+          tables={displayTables}
           sections={sections}
           activeOrders={activeOrders}
           onChangeTableStatus={onChangeTableStatus}
           onSeeAll={() => onNavigateToTab('home')}
-          serviceType={activeSection}
         />
-
-        {/* QUICK ACTIONS */}
-        <SectionCard icon="lightning-bolt" iconColor={COLORS.purple} title="Quick Actions">
-          <View style={styles.actionsGrid}>
-            <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('home')} hoverOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: COLORS.orange + '18' }]}>
-                <MaterialCommunityIcons name="table-plus" size={24} color={COLORS.orange} />
-              </View>
-              <Text style={styles.actionLabel}>Tables</Text>
-            </Hoverable>
-            <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('orders')} hoverOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: COLORS.primary + '18' }]}>
-                <MaterialCommunityIcons name="receipt-text" size={24} color={COLORS.primary} />
-              </View>
-              <Text style={styles.actionLabel}>Orders</Text>
-            </Hoverable>
-            <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('menu')} hoverOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: COLORS.green + '18' }]}>
-                <MaterialCommunityIcons name="book-open-variant" size={24} color={COLORS.green} />
-              </View>
-              <Text style={styles.actionLabel}>Menu</Text>
-            </Hoverable>
-            {/* Parity: History for both waiter and admin. */}
-            <Hoverable style={styles.actionBtn} onPress={() => onNavigateToTab('history')} hoverOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: COLORS.cyan + '18' }]}>
-                <MaterialCommunityIcons name="history" size={24} color={COLORS.cyan} />
-              </View>
-              <Text style={styles.actionLabel}>History</Text>
-            </Hoverable>
-          </View>
-        </SectionCard>
 
         <View style={{ height: 30 }} />
       </ScrollView>
@@ -605,30 +557,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: COLORS.primary,
     letterSpacing: 0.4,
-  },
-
-  /* Quick actions */
-  actionsGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  actionBtn: {
-    flex: 1,
-    alignItems: 'center',
-    gap: 8,
-  },
-  actionIconWrap: {
-    width: 52,
-    height: 52,
-    borderRadius: 16,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  actionLabel: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLORS.text,
   },
 
   /* Section filter bar */
