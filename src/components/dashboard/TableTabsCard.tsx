@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Text, View, StyleSheet, Modal, Pressable, ScrollView, TouchableOpacity } from 'react-native';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
@@ -26,18 +26,7 @@ interface TableTabsCardProps {
   onOrderPress: (order: Order) => void;
   onChangeTableStatus: (tableId: number, status: string) => Promise<boolean>;
   onSeeAll: () => void;
-  serviceType?: ServiceType | 'all';
-}
-
-const ALL_TAB = 'ALL';
-
-const STATUS_LABELS: Record<string, string> = {
-  AVAILABLE: 'Free',
-  RESERVED: 'Reserved',
-};
-
-function tablePriority(table: Table): number {
-  return isReservedTable(table) ? 1 : 2;
+  serviceType?: ServiceType;
 }
 
 export function TableTabsCard({
@@ -50,7 +39,16 @@ export function TableTabsCard({
   onSeeAll,
   serviceType,
 }: TableTabsCardProps) {
-  const [tab, setTab] = useState<TableTab>('ALL');
+  const STATUS_LABELS: Record<string, string> = {
+    AVAILABLE: 'Free',
+    RESERVED: 'Reserved',
+  };
+
+  function tablePriority(table: Table): number {
+    return isReservedTable(table) ? 1 : 2;
+  }
+
+  const [tab, setTab] = useState<TableTab>('Indoor');
   const [hoveredTab, setHoveredTab] = useState<TableTab | null>(null);
   const [modalTable, setModalTable] = useState<Table | null>(null);
   const { breakpoint } = useResponsive();
@@ -118,7 +116,7 @@ export function TableTabsCard({
   // My Tables, they keep a single group with no area filter tabs.
   const isServiceView = serviceType === 'delivery' || serviceType === 'takeaway';
 
-  // Area filter tabs: All + every section present in the current list
+  // Area filter tabs: every section present in the current list
   // (Indoor, Roof, Cabin, Hall, Garden, Pool, Room, Outdoor…), in venue order.
   const sectionNames = useMemo(
     () =>
@@ -128,8 +126,14 @@ export function TableTabsCard({
     [visibleTables, sections, isServiceView],
   );
 
-  useEffect(() => {
-    if (tab !== ALL_TAB && !sectionNames.includes(tab)) setTab(ALL_TAB);
+  // Effective tab — derived during render (never setState-in-effect), so a
+  // refresh re-selects automatically: stored tab if still present, else the
+  // Indoor tab (the main floor), else the first area. Refresh rebuilds the
+  // list, so Indoor ends up selected with its tables showing.
+  const activeTab = useMemo(() => {
+    if (sectionNames.includes(tab)) return tab;
+    const indoor = sectionNames.find((n) => n.trim().toLowerCase() === 'indoor');
+    return indoor ?? sectionNames[0] ?? tab;
   }, [sectionNames, tab]);
 
   const counts = useMemo(() => {
@@ -142,21 +146,19 @@ export function TableTabsCard({
   }, [visibleTables, sections]);
 
   const sectionTabs = useMemo(
-    () => [
-      { key: ALL_TAB, label: 'All', count: visibleTables.length },
-      ...sectionNames.map((name) => ({
-        key: name,
-        label: name,
-        count: counts.get(name) ?? 0,
-      })),
-    ],
+    () => sectionNames.map((name) => ({
+      key: name,
+      label: name,
+      count: counts.get(name) ?? 0,
+    })),
     [sectionNames, counts, visibleTables.length],
   );
 
   const tabTables = useMemo(() => {
-    if (tab === ALL_TAB) return visibleTables;
-    return visibleTables.filter((t) => resolveTableSectionName(t, sections) === tab);
-  }, [visibleTables, tab, sections]);
+    // Delivery / Takeaway have no area tabs — show the whole service list.
+    if (isServiceView) return visibleTables;
+    return visibleTables.filter((t) => resolveTableSectionName(t, sections) === activeTab);
+  }, [visibleTables, activeTab, sections, isServiceView]);
 
   // Service views (Delivery / Takeaway) match My Tables: 3 per row on
   // phones, like the screenshot (D1..D10, Del 1..3).
@@ -180,18 +182,8 @@ export function TableTabsCard({
   // the shared fallback tables would render under "Indoor" while Delivery is
   // selected. Matches FloorPlanGrid's outer-filter grouping.
   const groupedTables = useMemo<[string, Table[]][]>(
-    () => {
-      if (
-        tab === ALL_TAB &&
-        (serviceType === 'delivery' || serviceType === 'takeaway')
-      ) {
-        return tabTables.length > 0
-          ? [[getServiceTypeLabel(serviceType), tabTables]]
-          : [];
-      }
-      return groupTablesBySection(tabTables, sections);
-    },
-    [tabTables, sections, tab, serviceType],
+    () => groupTablesBySection(tabTables, sections),
+    [tabTables, sections, serviceType],
   );
 
   const tabColor = COLORS.primary;
@@ -217,7 +209,7 @@ export function TableTabsCard({
           style={styles.tabsScroll}
         >
           {sectionTabs.map((item) => {
-            const isActive = tab === item.key;
+            const isActive = activeTab === item.key;
             const isHovered = hoveredTab === item.key;
             const highlighted = isActive || isHovered;
 

@@ -8,18 +8,51 @@ import {
   getFontSize,
   getTabBarHeight,
 } from '@/utils/responsive';
+import { persistToastNotification } from '@/utils/notifications';
 
 export type BottomToastTone = 'success' | 'info' | 'warning' | 'error';
+
+export type ToastNotificationType =
+  | 'order_ready'
+  | 'order_served'
+  | 'bill_requested'
+  | 'order_created'
+  | 'order_paid'
+  | 'table_status'
+  | 'order_assigned'
+  | 'print_proceeded';
+
+/** Links a popup to the Notifications screen list (popup-only toasts omit it). */
+export interface ToastNotificationMeta {
+  type: ToastNotificationType;
+  orderId?: number;
+  tableId?: number;
+  tableNumber?: string;
+  orderStatus?: string;
+}
 
 export interface BottomToastPayload {
   title: string;
   message?: string;
   tone?: BottomToastTone;
   durationMs?: number;
+  notification?: ToastNotificationMeta;
 }
 
-interface ToastItem extends BottomToastPayload {
+export interface ToastItem extends BottomToastPayload {
   key: number;
+}
+
+export type BottomToastListener = (toast: ToastItem) => void;
+
+const toastListeners = new Set<BottomToastListener>();
+
+/** Live subscription — the home Notifications list mirrors matching popups. */
+export function subscribeBottomToast(listener: BottomToastListener): () => void {
+  toastListeners.add(listener);
+  return () => {
+    toastListeners.delete(listener);
+  };
 }
 
 let _setToast: ((toast: ToastItem | null) => void) | null = null;
@@ -34,7 +67,35 @@ const TONE_META: Record<BottomToastTone, { accent: string; icon: 'check-circle' 
 };
 
 export function showBottomToast(payload: BottomToastPayload): void {
-  _setToast?.({ ...payload, key: Date.now() });
+  const item: ToastItem = { ...payload, key: Date.now() };
+  _setToast?.(item);
+  // Mirror order-event popups into the persisted Notifications list so they
+  // show up in the Notifications screen even when fired from a route where
+  // the home list isn't mounted (e.g. order-details). Popup-only toasts
+  // (server URL, printing info) carry no `notification` meta and are skipped.
+  const meta = item.notification;
+  if (meta) {
+    try {
+      persistToastNotification({
+        type: meta.type,
+        title: item.title,
+        message: item.message ?? '',
+        orderId: meta.orderId,
+        tableId: meta.tableId,
+        tableNumber: meta.tableNumber,
+        orderStatus: meta.orderStatus,
+      });
+    } catch {
+      // Cache write must never break the popup itself.
+    }
+  }
+  for (const listener of Array.from(toastListeners)) {
+    try {
+      listener(item);
+    } catch {
+      // A bad listener must never break the popup itself.
+    }
+  }
 }
 
 export function BottomToast() {

@@ -254,10 +254,48 @@ export function resetBaseUrl(): string {
 }
 
 function readSavedBaseUrl(): string {
+  // One centralized database: every browser/device must talk to the same
+  // production backend. localStorage is per-browser (Brave ≠ Edge ≠ Android),
+  // so a saved override in one browser would silently point it at a different
+  // server/DB than every other client. On web production builds (served from a
+  // real host, not localhost dev) the saved override is ignored so all
+  // browsers converge on the central URL. Local web dev (Metro on localhost)
+  // and native builds keep the override for development.
+  if (Platform.OS === 'web' && !isLocalDevHost()) return DEFAULT_BASE_URL;
   const saved = getStorageItemSync(BASE_URL_STORAGE_KEY);
   if (!saved || !saved.trim()) return DEFAULT_BASE_URL;
   const check = validateBaseUrl(saved);
   return check.ok ? check.url : DEFAULT_BASE_URL;
+}
+
+/** True on web when the page itself is served from a dev machine (Metro). */
+export function isLocalDevHost(): boolean {
+  if (Platform.OS !== 'web') return false;
+  try {
+    if (typeof window === 'undefined' || !window.location?.hostname) return false;
+    const host = window.location.hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pin this client to the centralized backend URL.
+ * Call once at startup (before session hydration): on web production builds
+ * any divergent saved override is dropped so Brave, Edge, and every other
+ * browser use the same server and the same database. Returns the URL in effect.
+ */
+export function pinToCentralUrl(): string {
+  if (Platform.OS === 'web' && !isLocalDevHost()) {
+    removeStorageItemSync(BASE_URL_STORAGE_KEY);
+    const next = normalizeBaseUrl(DEFAULT_BASE_URL);
+    if (next !== currentBaseUrl) {
+      currentBaseUrl = next;
+      notifyBaseUrlChange();
+    }
+  }
+  return currentBaseUrl;
 }
 
 // Restore the saved URL (already synchronously available on web; on native it

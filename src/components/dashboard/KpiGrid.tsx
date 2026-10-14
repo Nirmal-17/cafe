@@ -31,7 +31,7 @@ export function KpiGrid({ kpis }: { kpis: DashboardKpi[] }) {
               onPress={kpi.onPress}
               hoverOpacity={0.8}
             >
-              <MaterialCommunityIcons name={kpi.icon as any} size={22} color={kpi.color} />
+              <MaterialCommunityIcons name={kpi.icon as any} size={19} color={kpi.color} />
               <Text
                 style={[styles.value, { color: kpi.color }]}
                 numberOfLines={1}
@@ -53,14 +53,14 @@ export function KpiGrid({ kpis }: { kpis: DashboardKpi[] }) {
 const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
-    gap: 10,
-    marginBottom: 10,
+    gap: 8,
+    marginBottom: 8,
   },
   card: {
     flex: 1,
     backgroundColor: COLORS.white,
-    borderRadius: 14,
-    padding: 14,
+    borderRadius: 12,
+    padding: 10,
     borderWidth: 1,
     borderColor: COLORS.border,
     borderLeftWidth: 3,
@@ -72,12 +72,12 @@ const styles = StyleSheet.create({
     elevation: 0,
   },
   value: {
-    fontSize: 20,
+    fontSize: 17,
     fontWeight: '900',
-    marginTop: 6,
+    marginTop: 4,
   },
   label: {
-    fontSize: 11,
+    fontSize: 10,
     color: COLORS.muted,
     fontWeight: '600',
     textTransform: 'uppercase',

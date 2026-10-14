@@ -14,6 +14,7 @@ import {
   Image,
   BackHandler,
   Platform,
+  AppState,
   LayoutAnimation,
   UIManager,
   useWindowDimensions,
@@ -29,22 +30,29 @@ import { api, Table, Section, Order, StaffUser, isReservedTable } from '@/servic
 import { homeApi } from '@/services/homeApi';
 import { orderApi } from '@/services/orderApi';
 import { getStorageItemSync, setStorageItemSync, removeStorageItemSync } from '@/utils/storage';
+import { isLocalDevHost } from '@/config/apiConfig';
 import { clearSession, loadSession } from '@/utils/sessions';
 import { executeOrderPrint } from '@/utils/print';
 import { webAlert } from '@/utils/webAlert';
 import { useResponsive, getResponsiveValue, getSpacing, getFontSize, getBorderRadius, getTabBarHeight, getHeaderHeight, getColumnCount, getCardWidth, getGridGap, getCardPadding, getIconSize, moderateScale } from '@/utils/responsive';
 import {
   StoredNotification,
-  fromServerNotification,
-  getCachedNotifications,
+  buildLocalNotification,
   cacheNotifications,
   clearCachedNotifications,
+  countUnread,
+  fromServerNotification,
+  getCachedNotifications,
+  markAllLocalNotificationsRead,
+  markLocalNotificationRead,
+  prependNotification,
+  removeLocalNotification,
 } from '@/utils/notifications';
 import { notifyOrderReady } from '@/utils/orderReadyToast';
 import { notifyOrderServed } from '@/utils/orderServedToast';
 import { notifyBillRequested } from '@/utils/orderBillToast';
 import { notifyPrintProceeded } from '@/utils/printProceededToast';
-import { showBottomToast } from '@/components/BottomToast';
+import { showBottomToast, subscribeBottomToast } from '@/components/BottomToast';
 import { subscribeMainTabSwitch, subscribeMainRefresh } from '@/utils/mainTab';
 import { resolveTableSectionName } from '@/utils/tableSections';
 import { isOpenOrder } from '@/utils/openValue';
@@ -210,7 +218,6 @@ export default function MainAppContainer() {
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
   const [todayBill, setTodayBill] = useState<number>(0);
   const [ordersSearchQuery, setOrdersSearchQuery] = useState('');
-  const [orderStatusFilter, setOrderStatusFilter] = useState<'ALL' | 'SERVED'>('ALL');
 
   // ── Past Order History (handled by PastOrdersScreen component) ──
 
@@ -219,23 +226,105 @@ export default function MainAppContainer() {
   const [refreshing, setRefreshing] = useState(false);
   const [homeError, setHomeError] = useState<string>('');
 
-  // ── Notifications: server-backed per-user list; cache only hydrates the first paint ──
+  // ── Notifications: local-first list; the server feed (when it exists)
+  // replaces it, otherwise order events keep the badge counting. ──
   const [notificationsList, setNotificationsList] = useState<StoredNotification[]>(() => getCachedNotifications());
   const [unreadCount, setUnreadCount] = useState<number>(() =>
-    getCachedNotifications().filter((n) => !n.read).length
+    countUnread(getCachedNotifications())
   );
 
+  /** Append (or refresh) one local notification and recount the badge. */
+  const pushLocalNotification = useCallback((item: StoredNotification) => {
+    setNotificationsList((prev) => {
+      const next = prependNotification(prev, item);
+      setUnreadCount(countUnread(next));
+      cacheNotifications(next);
+      return next;
+    });
+  }, []);
+
   const refreshNotifications = useCallback(async () => {
+    // Hydrate from the persisted cache FIRST so the bell list/badge paint
+    // instantly without waiting on the network; the server feed (when it
+    // exists) merges on top below.
+    const cached = getCachedNotifications();
+    setNotificationsList(cached);
+    setUnreadCount(countUnread(cached));
     const res = await homeApi.getNotifications('notifications-refresh');
     if (res.success && res.data) {
-      const list = res.data.notifications.map(fromServerNotification);
+      const serverList = res.data.notifications.map(fromServerNotification);
+      const serverIds = new Set(serverList.map((n) => n.id));
+      // Keep locally-mirrored popup rows (non-numeric ids the server never
+      // issues) across a server refresh — popups must not vanish from the
+      // Notifications screen just because the feed answered.
+      const keptLocal = getCachedNotifications().filter(
+        (n) => !serverIds.has(n.id) && !/^\d+$/.test(n.id),
+      );
+      const list = [...keptLocal, ...serverList].slice(0, 100);
       setNotificationsList(list);
-      setUnreadCount(res.data.unreadCount);
+      // Count the rows actually shown (server counter knows nothing of local rows).
+      setUnreadCount(countUnread(list));
       cacheNotifications(list);
     } else if (res.status === 401 || res.status === 403) {
       // Handled by fetchData / selective refetch paths on next cycle.
+    } else {
+      // No server feed (notably 404/HTML on servers with no /notifications
+      // route): hydrate from the persisted cache so popups fired while this
+      // screen was unmounted (e.g. order-details) still show up in the bell
+      // list instead of being silently dropped.
+      const cached = getCachedNotifications();
+      setNotificationsList(cached);
+      setUnreadCount(countUnread(cached));
     }
+    // Any other failure (notably 404/HTML on servers with no /notifications
+    // route): keep the local list so the badge keeps counting.
   }, []);
+
+  // Local read/clear fallbacks used when the server has no /notifications
+  // routes — NotificationScreen calls these after a route-missing response.
+  const markNotificationReadLocal = useCallback((id: string) => {
+    setNotificationsList((prev) => {
+      const next = markLocalNotificationRead(prev, id);
+      setUnreadCount(countUnread(next));
+      cacheNotifications(next);
+      return next;
+    });
+  }, []);
+
+  const markAllNotificationsReadLocal = useCallback(() => {
+    setNotificationsList((prev) => {
+      const next = markAllLocalNotificationsRead(prev);
+      setUnreadCount(0);
+      cacheNotifications(next);
+      return next;
+    });
+  }, []);
+
+  const clearNotificationLocal = useCallback((id: string) => {
+    setNotificationsList((prev) => {
+      const next = removeLocalNotification(prev, id);
+      setUnreadCount(countUnread(next));
+      cacheNotifications(next);
+      return next;
+    });
+  }, []);
+
+  const clearAllNotificationsLocal = useCallback(() => {
+    setNotificationsList([]);
+    setUnreadCount(0);
+    cacheNotifications([]);
+  }, []);
+
+  // Opening the bell always shows the latest persisted popups first (they may
+  // have been written while this screen was unmounted), then attempts a
+  // server refresh on top.
+  useEffect(() => {
+    if (activeTab !== 'notifications') return;
+    const cached = getCachedNotifications();
+    setNotificationsList(cached);
+    setUnreadCount(countUnread(cached));
+    refreshNotifications().catch(() => {});
+  }, [activeTab, refreshNotifications]);
 
   // ── API Fetch Coordination ──
   // Generation counter: a newer fetch invalidates older in-flight ones so a
@@ -261,22 +350,29 @@ export default function MainAppContainer() {
     return tablesRef.current.find((t) => t.id === order.tableId)?.tableNumber;
   }, []);
 
+  const tableIdForOrder = useCallback((orderId: unknown): number | undefined => {
+    const id = Number(orderId);
+    if (!Number.isFinite(id)) return undefined;
+    const tid = Number(activeOrdersRef.current.find((o) => o.id === id)?.tableId);
+    return Number.isFinite(tid) ? tid : undefined;
+  }, []);
+
   const notifyReadyWithTable = useCallback(
     (orderId: unknown) => {
       const id = Number(orderId);
       if (!Number.isFinite(id)) return;
-      notifyOrderReady(id, tableNumberForOrder(id));
+      notifyOrderReady(id, tableNumberForOrder(id), tableIdForOrder(id));
     },
-    [tableNumberForOrder],
+    [tableNumberForOrder, tableIdForOrder],
   );
 
   const notifyServedWithTable = useCallback(
     (orderId: unknown) => {
       const id = Number(orderId);
       if (!Number.isFinite(id)) return;
-      notifyOrderServed(id, tableNumberForOrder(id));
+      notifyOrderServed(id, tableNumberForOrder(id), tableIdForOrder(id));
     },
-    [tableNumberForOrder],
+    [tableNumberForOrder, tableIdForOrder],
   );
 
   // Bill requests complete the order, so it may already be gone from the active
@@ -287,10 +383,145 @@ export default function MainAppContainer() {
       if (!Number.isFinite(id)) return;
       const tid = Number(tableId);
       const tableName = Number.isFinite(tid) ? api.resolveTableName(tid) : undefined;
-      notifyBillRequested(id, tableName || tableNumberForOrder(id));
+      notifyBillRequested(
+        id,
+        tableName || tableNumberForOrder(id),
+        Number.isFinite(tid) ? tid : tableIdForOrder(id),
+      );
     },
-    [tableNumberForOrder],
+    [tableNumberForOrder, tableIdForOrder],
   );
+
+  // Orders already seen as READY/SERVED/billed — polling diffs only notify on
+  // NEW transitions, never for rows already READY on first load.
+  const seenReadyOrderIdsRef = useRef<Set<number>>(new Set());
+  const seenServedOrderIdsRef = useRef<Set<number>>(new Set());
+  const seenBilledOrderIdsRef = useRef<Set<number>>(new Set());
+  const notifiedReadyIdsRef = useRef<Set<string>>(new Set());
+
+  /** Push one deduped local notification per (type, orderId). */
+  const pushOrderNotification = useCallback((item: StoredNotification) => {
+    if (item.orderId != null && !Number.isFinite(item.orderId)) return;
+    if (notifiedReadyIdsRef.current.has(item.id)) return;
+    notifiedReadyIdsRef.current.add(item.id);
+    if (notifiedReadyIdsRef.current.size > 200) {
+      const first = notifiedReadyIdsRef.current.values().next().value;
+      if (first !== undefined) notifiedReadyIdsRef.current.delete(first);
+    }
+    pushLocalNotification(item);
+  }, [pushLocalNotification]);
+
+  // Mirror every order-event popup into the Notifications list while mounted.
+  // (showBottomToast also persists to cache, so popups fired from other
+  // routes — e.g. order-details — are picked up on the next mount/refresh.)
+  useEffect(() => {
+    return subscribeBottomToast((toast) => {
+      const meta = toast.notification;
+      if (!meta) return;
+      const orderId = Number(meta.orderId);
+      const metaTableId = Number(meta.tableId);
+      let tableId = Number.isFinite(metaTableId) ? metaTableId : undefined;
+      if (tableId == null && meta.tableNumber) {
+        const label = meta.tableNumber.trim().toLowerCase();
+        const match = tablesRef.current.find(
+          (t) => t.tableNumber.trim().toLowerCase() === label,
+        );
+        if (match) tableId = match.id;
+      }
+      pushOrderNotification(buildLocalNotification({
+        type: meta.type,
+        title: toast.title,
+        message: toast.message ?? '',
+        orderId: Number.isFinite(orderId) ? orderId : undefined,
+        tableId,
+        tableNumber: meta.tableNumber,
+        orderStatus: meta.orderStatus,
+      }));
+    });
+  }, [pushOrderNotification]);
+
+  /** Reset per-server transition tracking (URL switch / logout / expiry). */
+  const resetNotificationTracking = useCallback(() => {
+    seenReadyOrderIdsRef.current.clear();
+    seenServedOrderIdsRef.current.clear();
+    seenBilledOrderIdsRef.current.clear();
+    notifiedReadyIdsRef.current.clear();
+  }, []);
+
+  /**
+   * Diff a fresh active-orders snapshot against what was seen before: any
+   * order newly READY / SERVED / bill-requested since the last snapshot gets
+   * a local notification. First snapshot only seeds the seen-sets.
+   */
+  const notifyForOrderTransitions = useCallback((orders: Order[]) => {
+    const firstRun =
+      seenReadyOrderIdsRef.current.size === 0 &&
+      seenServedOrderIdsRef.current.size === 0 &&
+      seenBilledOrderIdsRef.current.size === 0;
+    for (const o of orders) {
+      const id = Number(o.id);
+      if (!Number.isFinite(id)) continue;
+      const status = String(o.status ?? '').toUpperCase();
+      const billed = Boolean((o as { billRequested?: boolean }).billRequested);
+      const tableLabel =
+        o.table?.tableNumber || tablesRef.current.find((t) => t.id === o.tableId)?.tableNumber;
+      if (status === 'READY' && !seenReadyOrderIdsRef.current.has(id)) {
+        seenReadyOrderIdsRef.current.add(id);
+        if (!firstRun) {
+          notifyReadyWithTable(id);
+          pushOrderNotification(buildLocalNotification({
+            type: 'order_ready',
+            title: 'Order Ready',
+            message: tableLabel
+              ? `${tableLabel} — order #${id} is ready for pickup`
+              : `Order #${id} is ready for pickup`,
+            orderId: id,
+            tableId: o.tableId,
+            tableNumber: tableLabel,
+            orderStatus: 'READY',
+          }));
+        }
+      }
+      if (status === 'SERVED' && !seenServedOrderIdsRef.current.has(id)) {
+        seenServedOrderIdsRef.current.add(id);
+        if (!firstRun) {
+          notifyServedWithTable(id);
+          pushOrderNotification(buildLocalNotification({
+            type: 'order_served',
+            title: 'Order Served',
+            message: tableLabel
+              ? `${tableLabel} — order #${id} served`
+              : `Order #${id} served`,
+            orderId: id,
+            tableId: o.tableId,
+            tableNumber: tableLabel,
+            orderStatus: 'SERVED',
+          }));
+        }
+      }
+      if (billed && !seenBilledOrderIdsRef.current.has(id)) {
+        seenBilledOrderIdsRef.current.add(id);
+        if (!firstRun) {
+          notifyBillWithTable(id, o.tableId);
+          pushOrderNotification(buildLocalNotification({
+            type: 'bill_requested',
+            title: 'Bill Requested',
+            message: tableLabel
+              ? `${tableLabel} — order #${id} requested the bill`
+              : `Order #${id} requested the bill`,
+            orderId: id,
+            tableId: o.tableId,
+            tableNumber: tableLabel,
+          }));
+        }
+      }
+    }
+    // Drop ids for orders that left the active list so a reused id can notify again.
+    const live = new Set(orders.map((o) => Number(o.id)));
+    for (const s of [seenReadyOrderIdsRef, seenServedOrderIdsRef, seenBilledOrderIdsRef]) {
+      for (const id of s.current) if (!live.has(id)) s.current.delete(id);
+    }
+  }, [notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable, pushOrderNotification]);
 
   // Force local logout when the JWT is missing/expired/invalid (401/403).
   // Does not call the server (the token is already rejected there).
@@ -301,6 +532,7 @@ export default function MainAppContainer() {
     clearCachedNotifications();
     setNotificationsList([]);
     setUnreadCount(0);
+    resetNotificationTracking();
     api.abortAllRequests();
     api.setToken(null);
     setUser(null);
@@ -310,10 +542,10 @@ export default function MainAppContainer() {
     // already showing, a "Session Expired" dialog would only be noise.
     if (!hadToken) return;
     webAlert('Session Expired', reason, [{ text: 'Sign In Again' }]);
-  }, []);
+  }, [resetNotificationTracking]);
 
   // ── Today's Bill — same math as the dashboard KPI: Σ totalAmount of today's
-  // PAID orders, so every settlement (bill request or checkout) is recorded.
+  // PAID + bill-requested orders, so a bill request already counts toward the total.
   const lastTodayBillAtRef = useRef(0);
   const fetchTodayBill = useCallback(async () => {
     if (!isLoggedIn) return;
@@ -332,9 +564,31 @@ export default function MainAppContainer() {
         dateTo: dayEnd.toISOString(),
       });
       if (res.success && res.data) {
-        const revenue = res.data.orders
-          .filter((o) => o.paymentStatus === 'PAID')
-          .reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+        const baseUrl = api.getBaseUrl();
+        const isBilled = (o: Order) =>
+          o.paymentStatus === 'PAID' ||
+          Boolean((o as { billRequested?: boolean }).billRequested) ||
+          isBillRequested(o.id, baseUrl);
+        const seen = new Set<number>();
+        let revenue = 0;
+        for (const o of res.data.orders) {
+          if (!isBilled(o)) continue;
+          const id = Number(o.id);
+          if (Number.isFinite(id)) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+          }
+          revenue += Number(o.totalAmount || 0);
+        }
+        // Bill-requested rows still sitting in the active list (not yet in the
+        // history snapshot) count too — deduped by id.
+        for (const o of activeOrdersRef.current) {
+          const id = Number(o.id);
+          if (!Number.isFinite(id) || seen.has(id)) continue;
+          if (!isBilled(o)) continue;
+          seen.add(id);
+          revenue += Number(o.totalAmount || 0);
+        }
         setTodayBill(revenue);
       } else if (res.status === 401 || res.status === 403) {
         forceSessionExpiry('Your session is no longer valid. Please sign in again.');
@@ -439,6 +693,7 @@ export default function MainAppContainer() {
         // card) from the Order Details list even if the server still returns
         // the rows until payment.
         const baseUrl = api.getBaseUrl();
+        notifyForOrderTransitions(activeOrdersRes.data);
         const visible = activeOrdersRes.data.filter(
           (o) => !o.billRequested && !isBillRequested(o.id, baseUrl),
         );
@@ -452,6 +707,12 @@ export default function MainAppContainer() {
           first.status === 0
             ? `Cannot reach server at ${api.getBaseUrl()} — check connection or server URL`
             : first.error || 'Server unreachable — check connection or server URL',
+        );
+      } else if (results.some((r) => r.success && (r as { status?: number }).status === 0)) {
+        // All feeds answered from the last saved snapshot (offline): usable,
+        // but explicitly stale — never mistaken for live central data.
+        setHomeError(
+          `Offline — showing last saved data. Reconnect to ${api.getBaseUrl()} to sync.`,
         );
       } else {
         setHomeError('');
@@ -467,7 +728,7 @@ export default function MainAppContainer() {
         setRefreshing(false);
       }
     }
-  }, [isLoggedIn, refreshNotifications, forceSessionExpiry, withTableStatusOverrides, syncReservations]);
+  }, [isLoggedIn, refreshNotifications, forceSessionExpiry, withTableStatusOverrides, syncReservations, notifyForOrderTransitions]);
 
   // ── Table status changes (reserve / free / mark bill) ──
   // Optimistic: flip the local snapshot immediately so the press paints on the
@@ -593,7 +854,7 @@ export default function MainAppContainer() {
 
     // Coalescing scheduler: keyed, trailing-edge. The first call for a key runs
     // on the next tick; calls inside the window are merged into that pending run
-    // (the old drop-throttle silently discarded them until the 30s heartbeat).
+    // (the old drop-throttle silently discarded them until the heartbeat).
     const timers = new Map<string, { handle: ReturnType<typeof setTimeout>; fn: () => void | Promise<void> }>();
     const lastRunAt = new Map<string, number>();
     const schedule = (key: string, fn: () => void | Promise<void>) => {
@@ -621,6 +882,7 @@ export default function MainAppContainer() {
       }
       if (res.success && res.data) {
         const baseUrl = api.getBaseUrl();
+        notifyForOrderTransitions(res.data);
         const visible = res.data.filter(
           (o) => !o.billRequested && !isBillRequested(o.id, baseUrl),
         );
@@ -657,28 +919,94 @@ export default function MainAppContainer() {
         case 'order.status':
           if (event.payload?.status === 'READY') {
             notifyReadyWithTable(event.payload.orderId);
+            pushOrderNotification(buildLocalNotification({
+              type: 'order_ready',
+              title: 'Order Ready',
+              message: (() => {
+                const label = tableNumberForOrder(event.payload.orderId);
+                const id = Number(event.payload.orderId);
+                return label ? `${label} — order #${id} is ready for pickup` : `Order #${id} is ready for pickup`;
+              })(),
+              orderId: Number(event.payload.orderId),
+              tableNumber: tableNumberForOrder(event.payload.orderId),
+              orderStatus: 'READY',
+            }));
           }
           if (event.payload?.status === 'SERVED') {
             notifyServedWithTable(event.payload.orderId);
+            pushOrderNotification(buildLocalNotification({
+              type: 'order_served',
+              title: 'Order Served',
+              message: (() => {
+                const label = tableNumberForOrder(event.payload.orderId);
+                const id = Number(event.payload.orderId);
+                return label ? `${label} — order #${id} served` : `Order #${id} served`;
+              })(),
+              orderId: Number(event.payload.orderId),
+              tableNumber: tableNumberForOrder(event.payload.orderId),
+              orderStatus: 'SERVED',
+            }));
           }
           if (event.payload?.billRequested === true) {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
             markBillRequested(event.payload.orderId, api.getBaseUrl());
+            pushOrderNotification(buildLocalNotification({
+              type: 'bill_requested',
+              title: 'Bill Requested',
+              message: (() => {
+                const tid = Number(event.payload.tableId);
+                const label = Number.isFinite(tid)
+                  ? api.resolveTableName(tid)
+                  : tableNumberForOrder(event.payload.orderId);
+                const id = Number(event.payload.orderId);
+                return label ? `${label} — order #${id} requested the bill` : `Order #${id} requested the bill`;
+              })(),
+              orderId: Number(event.payload.orderId),
+              tableId: Number.isFinite(Number(event.payload.tableId)) ? Number(event.payload.tableId) : undefined,
+            }));
           }
           schedule('orders+tables', refetchOrdersAndTables);
           break;
         case 'notification.created':
           if (event.payload?.type === 'order_ready') {
             notifyReadyWithTable(event.payload.orderId);
+            pushOrderNotification(buildLocalNotification({
+              type: 'order_ready',
+              title: String(event.payload?.title || 'Order Ready'),
+              message: String(event.payload?.message || `Order #${Number(event.payload.orderId)} is ready for pickup`),
+              orderId: Number(event.payload.orderId),
+              tableNumber: tableNumberForOrder(event.payload.orderId),
+              orderStatus: 'READY',
+            }));
           }
           if (event.payload?.type === 'order_served') {
             notifyServedWithTable(event.payload.orderId);
+            pushOrderNotification(buildLocalNotification({
+              type: 'order_served',
+              title: String(event.payload?.title || 'Order Served'),
+              message: String(event.payload?.message || `Order #${Number(event.payload.orderId)} served`),
+              orderId: Number(event.payload.orderId),
+              tableNumber: tableNumberForOrder(event.payload.orderId),
+              orderStatus: 'SERVED',
+            }));
           }
           if (event.payload?.type === 'bill_requested') {
             notifyBillWithTable(event.payload.orderId, event.payload.tableId);
             markBillRequested(event.payload.orderId, api.getBaseUrl());
+            pushOrderNotification(buildLocalNotification({
+              type: 'bill_requested',
+              title: String(event.payload?.title || 'Bill Requested'),
+              message: String(event.payload?.message || `Order #${Number(event.payload.orderId)} requested the bill`),
+              orderId: Number(event.payload.orderId),
+              tableId: Number.isFinite(Number(event.payload.tableId)) ? Number(event.payload.tableId) : undefined,
+            }));
           }
           schedule('notifications', refreshNotifications);
+          break;
+        case 'menu.availability':
+          // Another device changed item availability — drop the cached menu so
+          // the next menu open (order pad / Menu tab) fetches it fresh.
+          api.invalidateMenuCache();
           break;
         default:
           schedule('all', fetchData);
@@ -687,10 +1015,11 @@ export default function MainAppContainer() {
     });
 
     // Fallback heartbeat: heals any missed events on every platform.
-    // 30s to reduce UI churn.
+    // 10s so a change made on another device (browser / Android / Expo) shows
+    // here quickly even when the real-time event stream is down.
     const intervalId = setInterval(() => {
       fetchData();
-    }, 30000);
+    }, 10000);
 
     return () => {
       unsubscribe();
@@ -699,11 +1028,34 @@ export default function MainAppContainer() {
       timers.clear();
       api.abortAllRequests();
     };
-  }, [isLoggedIn, fetchData, refreshTables, refreshNotifications, forceSessionExpiry, consumeSelfTableChange, notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable]);
+  }, [isLoggedIn, fetchData, refreshTables, refreshNotifications, forceSessionExpiry, consumeSelfTableChange, notifyReadyWithTable, notifyServedWithTable, notifyBillWithTable, pushOrderNotification, tableNumberForOrder, notifyForOrderTransitions]);
 
   // Pushed screens (order-details: bill request, cashier checkout) ask for a
-  // resync right after their write — without waiting for the 30s heartbeat.
+  // resync right after their write — without waiting for the heartbeat.
   useEffect(() => subscribeMainRefresh(() => { fetchData(); }), [fetchData]);
+
+  // Refetch the moment this device comes back to the foreground: a change made
+  // on another device while this tab/app was in the background shows instantly
+  // instead of waiting for the next heartbeat. Web listens to tab focus,
+  // Android/iOS to the native app state.
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    if (Platform.OS === 'web') {
+      if (typeof window === 'undefined' || typeof document === 'undefined') return;
+      const onFocus = () => { fetchData(); };
+      const onVisibility = () => { if (document.visibilityState === 'visible') fetchData(); };
+      window.addEventListener('focus', onFocus);
+      document.addEventListener('visibilitychange', onVisibility);
+      return () => {
+        window.removeEventListener('focus', onFocus);
+        document.removeEventListener('visibilitychange', onVisibility);
+      };
+    }
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') fetchData();
+    });
+    return () => { sub.remove(); };
+  }, [isLoggedIn, fetchData]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -732,14 +1084,17 @@ export default function MainAppContainer() {
     clearCachedNotifications();
     setNotificationsList([]);
     setUnreadCount(0);
+    resetNotificationTracking();
     removeStorageItemSync('smart_cafe_cleared_history');
     setHomeError('');
     setHomeLoading(true);
-  }, [fetchData]);
+  }, [fetchData, resetNotificationTracking]);
 
   const handleLoginSuccess = (loggedUser: StaffUser) => {
     setUser(loggedUser);
     setIsLoggedIn(true);
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setActiveTab('dashboard');
     setHomeLoading(true);
     fetchData();
   };
@@ -750,6 +1105,7 @@ export default function MainAppContainer() {
     clearCachedNotifications();
     setNotificationsList([]);
     setUnreadCount(0);
+    resetNotificationTracking();
     setUser(null);
     setIsLoggedIn(false);
     setActiveTab('dashboard');
@@ -836,7 +1192,7 @@ export default function MainAppContainer() {
       const order = activeOrders.find(o => o.id === orderId);
       const success = await executeOrderPrint(orderId, order);
       if (success) {
-        notifyPrintProceeded(orderId, tableNumberForOrder(orderId) || order?.table?.tableNumber);
+        notifyPrintProceeded(orderId, tableNumberForOrder(orderId) || order?.table?.tableNumber, order?.tableId);
       } else {
         showBottomToast({
           title: 'Printing',
@@ -1126,8 +1482,6 @@ export default function MainAppContainer() {
             activeOrders={activeOrders}
             ordersSearchQuery={ordersSearchQuery}
             setOrdersSearchQuery={setOrdersSearchQuery}
-            orderStatusFilter={orderStatusFilter}
-            setOrderStatusFilter={setOrderStatusFilter}
             onShowDrawer={openDrawer}
             onOrderPress={(tableId) => router.push(`/order-details/${tableId}` as any)}
             onOrderStatusChange={handleOrderStatusChange}
@@ -1149,6 +1503,10 @@ export default function MainAppContainer() {
             unreadCount={unreadCount}
             onRefresh={refreshNotifications}
             onNavigateBack={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setActiveTab('dashboard'); }}
+            onMarkReadLocal={markNotificationReadLocal}
+            onMarkAllReadLocal={markAllNotificationsReadLocal}
+            onClearLocal={clearNotificationLocal}
+            onClearAllLocal={clearAllNotificationsLocal}
           />
         </Animated.View>
       )}
@@ -1287,6 +1645,15 @@ export default function MainAppContainer() {
               </TouchableOpacity>
             </View>
             <Text style={styles.modalSubtitle}>Address of the CafeOS backend. Include http:// and port (e.g. http://192.168.1.10:3000).</Text>
+            {Platform.OS === 'web' && !isLocalDevHost() ? (
+              <View style={{ backgroundColor: '#F0FDF4', borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0', padding: 14 }}>
+                <Text style={{ fontSize: 15, color: TEXT_DARK, fontWeight: '700' }}>{api.getBaseUrl()}</Text>
+                <Text style={{ fontSize: 12, color: TEXT_MUTED, marginTop: 6 }}>
+                  Shared production server — all browsers and devices use this address so everyone sees the same data.
+                </Text>
+              </View>
+            ) : (
+            <>
             <View style={{ backgroundColor: '#F8FAFC', borderRadius: 12, borderWidth: 1, borderColor: serverUrlError ? COLOR_ERROR : BORDER_COLOR, marginBottom: serverUrlError ? 6 : 12 }}>
               <TextInput
                 style={{ paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: TEXT_DARK, minHeight: 44 }}
@@ -1348,6 +1715,8 @@ export default function MainAppContainer() {
                 <Text style={styles.btnPrimaryText}>Save & Retry</Text>
               </Hoverable>
             </View>
+            </>
+            )}
           </Pressable>
         </Pressable>
       </Modal>

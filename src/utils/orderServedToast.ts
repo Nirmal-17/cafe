@@ -11,7 +11,7 @@ function formatTableLabel(tableNumber?: string): string | null {
   return /^table\s/i.test(tableNumber) ? tableNumber : `Table ${tableNumber}`;
 }
 
-export function notifyOrderServed(orderId: number | string | null | undefined, tableNumber?: string): void {
+export function notifyOrderServed(orderId: number | string | null | undefined, tableNumber?: string, tableId?: number | string | null): void {
   const id = Number(orderId);
   if (!Number.isFinite(id)) return;
 
@@ -27,12 +27,20 @@ export function notifyOrderServed(orderId: number | string | null | undefined, t
   }
 
   const tableLabel = formatTableLabel(tableNumber);
+  const tid = Number(tableId);
   showBottomToast({
     title: 'Marked Served',
     message: tableLabel
       ? `${tableLabel} — order #${id} served`
       : `Order #${id} served`,
     tone: 'success',
+    notification: {
+      type: 'order_served',
+      orderId: id,
+      tableId: Number.isFinite(tid) ? tid : undefined,
+      tableNumber,
+      orderStatus: 'SERVED',
+    },
   });
   playAlertSound();
 }

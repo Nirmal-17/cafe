@@ -10,7 +10,7 @@ function formatTableLabel(tableNumber?: string): string | null {
   return /^table\s/i.test(tableNumber) ? tableNumber : `Table ${tableNumber}`;
 }
 
-export function notifyOrderReady(orderId: number | string | null | undefined, tableNumber?: string): void {
+export function notifyOrderReady(orderId: number | string | null | undefined, tableNumber?: string, tableId?: number | string | null): void {
   const id = Number(orderId);
   if (!Number.isFinite(id)) return;
 
@@ -26,11 +26,19 @@ export function notifyOrderReady(orderId: number | string | null | undefined, ta
   }
 
   const tableLabel = formatTableLabel(tableNumber);
+  const tid = Number(tableId);
   showBottomToast({
     title: 'Order Ready',
     message: tableLabel
       ? `${tableLabel} — order #${id} is ready for pickup`
       : `Order #${id} is ready for pickup`,
     tone: 'success',
+    notification: {
+      type: 'order_ready',
+      orderId: id,
+      tableId: Number.isFinite(tid) ? tid : undefined,
+      tableNumber,
+      orderStatus: 'READY',
+    },
   });
 }

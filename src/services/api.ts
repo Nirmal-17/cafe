@@ -24,7 +24,6 @@ import {
 import type { RemoteCafeTable, RemoteCustomer, RemoteTableCategory } from '@/utils/productionFeeds';
 import type { NotificationListResponse } from '@/utils/notifications';
 import {
-  addOfflineOrder,
   getOfflineOrders,
   getOfflineOrdersForTable,
   isOfflineOrderId,
@@ -114,13 +113,6 @@ const readStatusOverrides = (): StatusOverrides => {
   } catch {
     return {};
   }
-};
-
-/** Remember a status change this server could not accept. */
-const rememberStatusOverride = (baseUrl: string, tableId: number, status: string): void => {
-  const all = readStatusOverrides();
-  all[baseUrl] = { ...(all[baseUrl] || {}), [String(tableId)]: String(status).toUpperCase() };
-  setStorageItemSync(TABLE_STATUS_OVERRIDES_KEY, JSON.stringify(all));
 };
 
 /** Drop a local stand-in — the server's own value is authoritative again. */
@@ -1059,14 +1051,14 @@ class ApiService {
     const res = await this.requestFeed<Table[]>('tables', '/tables');
     if (res.success && res.data) return this.serveTables(res.data, sectionId);
     if (!this.canFallback(res)) {
-      // Offline (status 0): serve the last floor-plan snapshot so the
-      // order pad can still open without any API.
+      // Offline (status 0): serve the last snapshot so the screen can render,
+      // explicitly marked stale — it is a temporary cache, never the truth.
       if (res.status === 0 && !res.aborted) {
         const cached = this.readCachedTables();
         if (cached) {
           const rows = applyLocalStatusOverrides(this.baseUrl, cached);
           const filtered = sectionId ? rows.filter((t) => t.sectionId === sectionId) : rows;
-          return { success: true, data: filtered, status: 0 };
+          return { success: true, data: filtered, status: 0, error: 'Offline — showing last saved data' };
         }
       }
       return res;
@@ -1086,7 +1078,7 @@ class ApiService {
       if (cached) {
         const rows = applyLocalStatusOverrides(this.baseUrl, cached);
         const filtered = sectionId ? rows.filter((t) => t.sectionId === sectionId) : rows;
-        return { success: true, data: filtered, status: 0 };
+        return { success: true, data: filtered, status: 0, error: 'Offline — showing last saved data' };
       }
     }
     return this.hasRouteMiss('tables') ? feedFailure<Table[]>(feed) : res;
@@ -1171,33 +1163,20 @@ class ApiService {
       (o) => o.status !== 'CANCELLED' && o.paymentStatus !== 'PAID',
     );
     if (!found) {
-      // Fully offline with no snapshot — still open the pad when local orders
-      // exist, otherwise report the real failure.
-      if (offline.length > 0) {
-        const placeholder = {
-          id,
-          sectionId: 0,
-          tableNumber: this.resolveTableName(id),
-          capacity: 4,
-          status: 'AVAILABLE',
-        } as Table;
-        return {
-          success: true,
-          status: res.status,
-          data: { ...placeholder, orders: offline, activeOrders: offline },
-        };
-      }
+      // No server row for this table: report the real failure instead of
+      // fabricating a placeholder table that exists on this device alone.
       return res;
     }
     return { success: true, data: { ...found, orders: offline, activeOrders: offline }, status: res.status };
   }
 
   /**
-   * Reserve / free a table (the only two table states). Servers implementing
-   * the api.txt contract answer PATCH /tables/:id/status; a read-only feed
-   * host has no such route, and failing there with a raw 404 would break
-   * "Free Table" / "Reserve" for no reason — so the change is remembered on
-   * this device and re-applied over every table read instead.
+   * Reserve / free a table (the only two table states). The write goes to the
+   * central backend only: when the server has no such route (or is
+   * unreachable) the failure is returned honestly instead of being remembered
+   * on this device. Device-local status stand-ins would diverge across
+   * browsers/devices (reserved here, free there), so they are never created —
+   * every client reads the same server state after a refetch.
    */
   async updateTableStatus(id: number, status: string): Promise<ApiResponse<Table>> {
     const res = await this.request<Table>(`/tables/${id}/status`, {
@@ -1209,19 +1188,7 @@ class ApiService {
       forgetStatusOverride(this.baseUrl, id);
       return res;
     }
-    // Auth, network and server faults keep their old, honest error path.
-    if (!isRouteMissing(res)) return res;
-
-    rememberStatusOverride(this.baseUrl, id, status);
-    const found = await this.getTable(id);
-    if (found.success && found.data) return { success: true, data: found.data, status: res.status };
-    // The feed is unreadable too — hand back just enough for the caller's
-    // optimistic patch ({ ...table, ...server }) without clobbering its name.
-    return {
-      success: true,
-      data: { id, status: status as Table['status'] } as Table,
-      status: res.status,
-    };
+    return res;
   }
 
   /**
@@ -1320,10 +1287,11 @@ class ApiService {
     if (options?.force) {
       const res = await fetchFresh();
       if (res.success) return res;
-      // Server unreachable: show the last known menu instead of an empty screen.
+      // Server unreachable: surface the failure — a stale snapshot may be
+      // shown by the caller only when explicitly marked stale, never as fresh.
       if (res.status === 0 && !res.aborted) {
         const cachedData = this.readCachedMenu();
-        if (cachedData) return { success: true, data: cachedData, status: 0 };
+        if (cachedData) return { success: true, data: cachedData, status: 0, error: 'Offline — showing last saved data' };
       }
       return res;
     }
@@ -1468,10 +1436,10 @@ class ApiService {
       const ids = new Set<number>();
       const merged = [...offline, ...cached].filter((o) => (ids.has(o.id) ? false : (ids.add(o.id), true)));
       if (merged.length > 0) {
-        return { success: true, data: merged, status: response.status };
+        return { success: true, data: merged, status: response.status, error: 'Offline — showing last saved data' };
       }
       if (offline.length > 0) {
-        return { success: true, data: offline, status: response.status };
+        return { success: true, data: offline, status: response.status, error: 'Offline — showing last saved data' };
       }
     }
     return response;
@@ -1492,11 +1460,11 @@ class ApiService {
   }
 
   /**
-   * Place an order. When the server has no order API (route missing) or the
-   * device is offline (status 0), the order is saved on this device and
-   * returned as success — the waiter can keep serving and print the bill
-   * without any API. Server errors (400/500) and auth failures still fail
-   * honestly: only "no route / no connection" falls back.
+   * Place an order against the central backend. The order is persisted
+   * server-side only: failures (offline, missing route, server error) are
+   * returned honestly so the caller can retry with the same clientRequestId
+   * (idempotent — the server dedupes replays) instead of forking a
+   * device-local copy that no other browser or device could ever see.
    */
   async createOrder(data: {
     tableId: number;
@@ -1515,55 +1483,7 @@ class ApiService {
       this.saveCachedActiveOrders([res.data, ...cached.filter((order) => order.id !== res.data!.id)]);
       return res;
     }
-    if (!res.aborted && (res.status === 0 || isRouteMissing(res))) {
-      const local = this.buildOfflineOrder(data);
-      addOfflineOrder(this.baseUrl, local);
-      const cached = this.getCachedActiveOrders();
-      this.saveCachedActiveOrders([local, ...cached.filter((order) => order.id !== local.id)]);
-      return { success: true, data: local, status: res.status };
-    }
     return res;
-  }
-
-  /**
-   * Build the device-local order saved when no order API is reachable. Prices
-   * come from the cart payload (already resolved against the cached menu by
-   * the order screen), so the totals match what the waiter saw.
-   */
-  private buildOfflineOrder(data: {
-    tableId: number;
-    waiterId?: number;
-    customerId?: number;
-    customerNotes?: string;
-    clientRequestId?: string;
-    items: { menuItemId: number; quantity: number; price: number; notes?: string }[];
-  }): Order {
-    const now = new Date().toISOString();
-    const total = data.items.reduce((sum, it) => sum + Number(it.price || 0) * Number(it.quantity || 0), 0);
-    return {
-      id: Date.now(),
-      tableId: data.tableId,
-      waiterId: data.waiterId ?? 0,
-      status: 'PENDING',
-      paymentStatus: 'UNPAID',
-      customerNotes: data.customerNotes ?? null,
-      subtotal: total,
-      totalAmount: total,
-      createdAt: now,
-      updatedAt: now,
-      table: { id: data.tableId, tableNumber: this.resolveTableName(data.tableId) } as Table,
-      items: data.items.map((it, idx) => ({
-        id: Date.now() + idx + 1,
-        menuItemId: it.menuItemId,
-        quantity: it.quantity,
-        price: Number(it.price),
-        notes: it.notes ?? null,
-        menuItem: {
-          id: it.menuItemId,
-          name: this.resolveMenuItemName(it.menuItemId),
-        } as MenuItem,
-      })),
-    } as Order;
   }
 
   async updateOrderStatus(id: number, status: string) {
@@ -1682,8 +1602,11 @@ class ApiService {
 
   /**
    * Settle a table's bill — POST /api/cashier/checkout with
-   * { tableId, orderIds, paymentMethod, amountPaid }. On success the local
-   * active-order mirror is dropped so paid orders can't resurface from cache.
+   * { tableId, orderIds, paymentMethod, amountPaid }. Settlement is persisted
+   * by the central backend only: a failure is returned honestly so the payment
+   * is never recorded on one device while the server (and every other client)
+   * still shows it unpaid. On success the local active-order mirror is dropped
+   * so paid orders can't resurface from cache.
    */
   async cashierCheckout(payload: {
     tableId: number;
@@ -1692,40 +1615,6 @@ class ApiService {
     amountPaid: number;
   }): Promise<ApiResponse<CheckoutResult>> {
     const offlineIds = payload.orderIds.filter((id) => isOfflineOrderId(id));
-    const serverIds = payload.orderIds.filter((id) => !isOfflineOrderId(id));
-    // All ids are device-local (or the checkout route is unreachable): settle
-    // locally — drop the rows so the table reads as free.
-    if (offlineIds.length > 0 && serverIds.length === 0) {
-      const res = await this.request<CheckoutResult>('/cashier/checkout', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      if (res.success) {
-        removeOfflineOrders(this.baseUrl, offlineIds);
-        const cached = this.getCachedActiveOrders();
-        this.saveCachedActiveOrders(cached.filter((o) => !offlineIds.includes(o.id)));
-        removeStorageItemSync(LOCAL_ACTIVE_ORDERS_KEY);
-        return res;
-      }
-      // Server could not settle (no route / offline) — local settlement still
-      // succeeds so the waiter is never stuck at the counter.
-      if (!res.aborted && (res.status === 0 || isRouteMissing(res))) {
-        removeOfflineOrders(this.baseUrl, offlineIds);
-        const cached = this.getCachedActiveOrders();
-        this.saveCachedActiveOrders(cached.filter((o) => !offlineIds.includes(o.id)));
-        return {
-          success: true,
-          status: res.status,
-          data: {
-            payment: { id: Date.now(), method: payload.paymentMethod, status: 'SUCCESS', amount: payload.amountPaid },
-            orders: offlineIds.map((id) => ({ id, paymentStatus: 'PAID', status: 'COMPLETED' })),
-            message: 'Settled on this device (offline)',
-          },
-        };
-      }
-      // A real server rejection keeps the local rows — surface the error.
-      return res;
-    }
     const res = await this.request<CheckoutResult>('/cashier/checkout', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -1738,26 +1627,30 @@ class ApiService {
   }
 
   // ─── Notifications (per-user read/clear) ───────────────────────────────────
+  // These are non-critical UI calls — a short deadline keeps every bell tap
+  // instant instead of hanging on the 20s default when the server is slow or
+  // has no /notifications routes at all.
   async getNotifications(requestKey?: string): Promise<ApiResponse<NotificationListResponse>> {
     return this.request<NotificationListResponse>('/notifications', {
       requestKey: requestKey || 'notifications',
+      timeoutMs: 5000,
     });
   }
 
   async markNotificationRead(id: number): Promise<ApiResponse<{ id: number; read: boolean }>> {
-    return this.request(`/notifications/${id}/read`, { method: 'PATCH' });
+    return this.request(`/notifications/${id}/read`, { method: 'PATCH', timeoutMs: 5000 });
   }
 
   async markAllNotificationsRead(): Promise<ApiResponse<{ updated: number }>> {
-    return this.request('/notifications/read-all', { method: 'POST' });
+    return this.request('/notifications/read-all', { method: 'POST', timeoutMs: 5000 });
   }
 
   async clearNotification(id: number): Promise<ApiResponse<{ id: number; cleared: boolean }>> {
-    return this.request(`/notifications/${id}`, { method: 'DELETE' });
+    return this.request(`/notifications/${id}`, { method: 'DELETE', timeoutMs: 5000 });
   }
 
   async clearAllNotifications(): Promise<ApiResponse<{ cleared: number }>> {
-    return this.request('/notifications/clear-all', { method: 'POST' });
+    return this.request('/notifications/clear-all', { method: 'POST', timeoutMs: 5000 });
   }
 
   // ─── In-memory caches for resolve methods (avoid repeated JSON.parse) ──

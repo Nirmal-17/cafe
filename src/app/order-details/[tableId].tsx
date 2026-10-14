@@ -12,6 +12,7 @@ import {
   BackHandler,
   Image,
   Platform,
+  AppState,
 } from 'react-native';
 
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -27,7 +28,7 @@ import { playAlertSound } from '@/utils/alertSound';
 import { switchMainTab, requestMainRefresh } from '@/utils/mainTab';
 import { markBillRequested, isBillRequested } from '@/utils/billRequested';
 import { goBackOrHome } from '@/utils/navigation';
-import { useReservationId } from '@/utils/reservations';
+import { useReservationId, releaseReservationId, assignReservationId } from '@/utils/reservations';
 
 const THEME_YELLOW = '#FFD600';
 const THEME_ORANGE = '#FF6D00';
@@ -119,10 +120,10 @@ export default function OrderDetailsScreen() {
 
       if (event.type === 'order.created' || event.type === 'order.status' || event.type === 'order.cancelled') {
         if (event.type === 'order.status' && event.payload?.status === 'READY') {
-          notifyOrderReady(event.payload.orderId, api.resolveTableName(tableIdNum));
+          notifyOrderReady(event.payload.orderId, api.resolveTableName(tableIdNum), tableIdNum);
         }
         if (event.type === 'order.status' && event.payload?.billRequested === true) {
-          notifyBillRequested(event.payload.orderId, api.resolveTableName(tableIdNum));
+          notifyBillRequested(event.payload.orderId, api.resolveTableName(tableIdNum), tableIdNum);
           markBillRequested(event.payload.orderId, api.getBaseUrl());
         }
         // Refetch to get fresh data with correct status/items
@@ -149,6 +150,35 @@ export default function OrderDetailsScreen() {
     return () => { mounted = false; };
   }, [fetchData]);
 
+  // Polling fallback: the event stream may be down (or the server may not run
+  // one at all) — re-read this table regularly so an order placed, served or
+  // billed on another device shows here too.
+  useEffect(() => {
+    if (!tableId) return;
+    const intervalId = setInterval(() => { fetchData(); }, 10000);
+    return () => clearInterval(intervalId);
+  }, [tableId, fetchData]);
+
+  // Same reason: refetch as soon as this screen regains focus.
+  useEffect(() => {
+    if (!tableId) return;
+    if (Platform.OS === 'web') {
+      if (typeof window === 'undefined' || typeof document === 'undefined') return;
+      const onFocus = () => { fetchData(); };
+      const onVisibility = () => { if (document.visibilityState === 'visible') fetchData(); };
+      window.addEventListener('focus', onFocus);
+      document.addEventListener('visibilitychange', onVisibility);
+      return () => {
+        window.removeEventListener('focus', onFocus);
+        document.removeEventListener('visibilitychange', onVisibility);
+      };
+    }
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') fetchData();
+    });
+    return () => { sub.remove(); };
+  }, [tableId, fetchData]);
+
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -164,13 +194,30 @@ export default function OrderDetailsScreen() {
     try {
       const response = await orderApi.requestBill(order.id);
       if (!response.success) throw new Error(response.error);
-      // Bill request checks the order out: drop ONLY this specific order
-      // card locally and record it globally so the Order Details list
-      // (grouped by table) no longer shows this table once its last open
-      // order is requested — even if the server still returns the row.
+      // Bill requested → free ONLY this specific table (e.g. indoor IN1), and
+      // only when it has no other open orders left. A table with 3 orders
+      // keeps its Reserved state until its last order is bill-requested.
+      const billedTableId = Number(tableId);
+      const remainingOpen = orders.filter(
+        (o) =>
+          o.id !== order.id &&
+          o.status !== 'CANCELLED' &&
+          o.paymentStatus !== 'PAID',
+      );
       billRequestedIdsRef.current.add(order.id);
       markBillRequested(order.id, api.getBaseUrl());
       setOrders((prev) => prev.filter((o) => o.id !== order.id));
+      if (remainingOpen.length === 0) {
+        releaseReservationId(billedTableId);
+        // Best-effort server PATCH; api.updateTableStatus remembers AVAILABLE
+        // locally when the host has no such route, so the floor plan still
+        // flips back to Free.
+        api.updateTableStatus(billedTableId, 'AVAILABLE').catch(() => {});
+      } else {
+        // Still has open orders → make sure it stays Reserved.
+        assignReservationId(billedTableId);
+        api.updateTableStatus(billedTableId, 'RESERVED').catch(() => {});
+      }
       // Table status is reserve-only — resync home now instead of waiting
       // for its next heartbeat.
       requestMainRefresh();
@@ -200,7 +247,7 @@ export default function OrderDetailsScreen() {
   const handleMarkServed = async (order: Order) => {
     try {
       await orderApi.updateOrderStatus(order.id, 'SERVED');
-      notifyOrderServed(order.id, table?.tableNumber);
+      notifyOrderServed(order.id, table?.tableNumber, table?.id ?? Number(tableId));
       await fetchData();
     } catch {
       await webAlert('Error', 'Failed to update order.');

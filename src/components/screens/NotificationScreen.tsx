@@ -15,7 +15,7 @@ import {
   StoredNotification,
 } from '@/utils/notifications';
 import { webAlert } from '@/utils/webAlert';
-import { api } from '@/services/api';
+import { api, isRouteMissing } from '@/services/api';
 import { switchMainTab } from '@/utils/mainTab';
 
 // ─────────────────────────────────────────────
@@ -38,9 +38,14 @@ interface NotificationScreenProps {
   unreadCount: number;
   onRefresh: () => void | Promise<void>;
   onNavigateBack?: () => void;
+  /** Local fallbacks when the server has no /notifications routes. */
+  onMarkReadLocal?: (id: string) => void;
+  onMarkAllReadLocal?: () => void;
+  onClearLocal?: (id: string) => void;
+  onClearAllLocal?: () => void;
 }
 
-export function NotificationScreen({ notifications, unreadCount, onRefresh, onNavigateBack }: NotificationScreenProps) {
+export function NotificationScreen({ notifications, unreadCount, onRefresh, onNavigateBack, onMarkReadLocal, onMarkAllReadLocal, onClearLocal, onClearAllLocal }: NotificationScreenProps) {
   const [refreshing, setRefreshing] = useState(false);
 
   const handleRefresh = useCallback(async () => {
@@ -52,25 +57,35 @@ export function NotificationScreen({ notifications, unreadCount, onRefresh, onNa
     }
   }, [onRefresh]);
 
-  const runAction = useCallback(async (action: () => Promise<{ success: boolean; error?: string }>) => {
+  const runAction = useCallback(async (action: () => Promise<{ success: boolean; error?: string; status?: number }>, fallback?: () => void) => {
+    // Optimistic: paint the local change instantly so every tap responds
+    // immediately, then reconcile with the server in the background.
+    fallback?.();
     const res = await action();
-    if (!res.success) {
-      await webAlert('Notification', res.error || 'Something went wrong — please try again.');
+    if (res.success) {
+      await onRefresh();
+      return;
     }
+    // Servers without the /notifications routes (404/405/HTML login page)
+    // are already handled by the optimistic update above — no error dialog.
+    if (isRouteMissing(res)) {
+      return;
+    }
+    await webAlert('Notification', res.error || 'Something went wrong — please try again.');
     await onRefresh();
   }, [onRefresh]);
 
   const handleMarkAsRead = useCallback((id: string) => {
-    return runAction(() => api.markNotificationRead(Number(id)));
-  }, [runAction]);
+    return runAction(() => api.markNotificationRead(Number(id)), () => onMarkReadLocal?.(id));
+  }, [runAction, onMarkReadLocal]);
 
   const handleMarkAllRead = useCallback(() => {
-    return runAction(() => api.markAllNotificationsRead());
-  }, [runAction]);
+    return runAction(() => api.markAllNotificationsRead(), () => onMarkAllReadLocal?.());
+  }, [runAction, onMarkAllReadLocal]);
 
   const handleClear = useCallback((id: string) => {
-    return runAction(() => api.clearNotification(Number(id)));
-  }, [runAction]);
+    return runAction(() => api.clearNotification(Number(id)), () => onClearLocal?.(id));
+  }, [runAction, onClearLocal]);
 
   const handleClearAll = useCallback(async () => {
     await webAlert(
@@ -82,12 +97,12 @@ export function NotificationScreen({ notifications, unreadCount, onRefresh, onNa
           text: 'Clear All',
           style: 'destructive',
           onPress: async () => {
-            await runAction(() => api.clearAllNotifications());
+            await runAction(() => api.clearAllNotifications(), () => onClearAllLocal?.());
           },
         },
       ]
     );
-  }, [runAction]);
+  }, [runAction, onClearAllLocal]);
 
   const handleNotificationPress = useCallback((item: StoredNotification) => {
     if (!item.read) {
@@ -123,6 +138,8 @@ export function NotificationScreen({ notifications, unreadCount, onRefresh, onNa
         return 'table-furniture';
       case 'order_assigned':
         return 'account-arrow-right';
+      case 'print_proceeded':
+        return 'printer';
       default:
         return 'bell-outline';
     }
@@ -143,6 +160,8 @@ export function NotificationScreen({ notifications, unreadCount, onRefresh, onNa
       case 'table_status':
         return BRAND_ORANGE;
       case 'order_assigned':
+        return BRAND_PRIMARY;
+      case 'print_proceeded':
         return BRAND_PRIMARY;
       default:
         return COLOR_MUTED;

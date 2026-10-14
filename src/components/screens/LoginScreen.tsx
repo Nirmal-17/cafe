@@ -16,7 +16,7 @@ import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { Hoverable } from '@/components/Hoverable';
 import { api, StaffUser } from '@/services/api';
 import { loadSession, saveSession, savedUsername } from '@/utils/sessions';
-import { DEFAULT_BASE_URL, describeLoopbackIssue } from '@/config/apiConfig';
+import { DEFAULT_BASE_URL, describeLoopbackIssue, isLocalDevHost } from '@/config/apiConfig';
 
 const COLORS = {
   panel: '#3F3D77',
@@ -69,6 +69,12 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
       setShowServerUrl((v) => !v);
     }
   };
+
+  // On web production builds every browser must use the same centralized
+  // backend: the server URL is pinned and shown read-only so one browser can
+  // never silently point at a different server/DB than the rest. Local web
+  // dev (Metro on localhost) and native builds keep the editable field.
+  const serverUrlLocked = Platform.OS === 'web' && !isLocalDevHost();
 
   // On a phone/emulator "localhost" is the device itself — the backend runs on
   // the computer, so spell out the reachable address instead of a bare
@@ -450,6 +456,17 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
       {showServerUrl ? (
         <View style={[styles.serverUrlCard, { width: Math.min(s(340), width - 48), padding: s(16), marginTop: s(18) }]}>
           <Text style={[styles.serverUrlLabel, { fontSize: s(12), marginBottom: s(8) }]}>SERVER URL</Text>
+          {serverUrlLocked ? (
+            <>
+              <Text style={[styles.serverUrlHint, { fontSize: s(13), color: '#1F2937' }]}>
+                {api.getBaseUrl()}
+              </Text>
+              <Text style={[styles.serverUrlHint, { fontSize: s(12), marginTop: s(8) }]}>
+                Shared production server — all browsers and devices use this address.
+              </Text>
+            </>
+          ) : (
+          <>
           <TextInput
             style={[styles.serverUrlInput, { height: s(44), fontSize: s(14), paddingHorizontal: s(12) }]}
             placeholder="http://localhost:3000"
@@ -503,6 +520,8 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
               </Text>
             </Hoverable>
           ) : null}
+          </>
+          )}
         </View>
       ) : null}
 

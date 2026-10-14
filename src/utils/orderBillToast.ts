@@ -10,7 +10,7 @@ function formatTableLabel(tableNumber?: string): string | null {
   return /^table\s/i.test(tableNumber) ? tableNumber : `Table ${tableNumber}`;
 }
 
-export function notifyBillRequested(orderId: number | string | null | undefined, tableNumber?: string): void {
+export function notifyBillRequested(orderId: number | string | null | undefined, tableNumber?: string, tableId?: number | string | null): void {
   const id = Number(orderId);
   if (!Number.isFinite(id)) return;
 
@@ -26,11 +26,18 @@ export function notifyBillRequested(orderId: number | string | null | undefined,
   }
 
   const tableLabel = formatTableLabel(tableNumber);
+  const tid = Number(tableId);
   showBottomToast({
     title: 'Bill Requested',
     message: tableLabel
       ? `${tableLabel} — order #${id} requested the bill`
       : `Order #${id} requested the bill`,
     tone: 'warning',
+    notification: {
+      type: 'bill_requested',
+      orderId: id,
+      tableId: Number.isFinite(tid) ? tid : undefined,
+      tableNumber,
+    },
   });
 }

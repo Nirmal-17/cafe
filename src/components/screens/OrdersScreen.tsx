@@ -52,10 +52,6 @@ const TEXT_MUTED = '#6B7280';
 // Types
 // ─────────────────────────────────────────────
 
-type OrderStatus =
-  | 'ALL'
-  | 'SERVED';
-
 interface OrdersScreenProps {
   refreshing: boolean;
   onRefresh: () => void;
@@ -64,9 +60,6 @@ interface OrdersScreenProps {
 
   ordersSearchQuery: string;
   setOrdersSearchQuery: (query: string) => void;
-
-  orderStatusFilter: OrderStatus;
-  setOrderStatusFilter: (status: OrderStatus) => void;
 
   onShowDrawer: () => void;
   onOrderPress: (tableId: number) => void;
@@ -90,8 +83,6 @@ export function OrdersScreen({
   activeOrders,
   ordersSearchQuery,
   setOrdersSearchQuery,
-  orderStatusFilter,
-  setOrderStatusFilter,
   onShowDrawer,
   onOrderPress,
   onOrderStatusChange,
@@ -188,13 +179,6 @@ export function OrdersScreen({
       .map((section) => {
         const filteredOrders = section.orders.filter(
           (order) => {
-            if (
-              orderStatusFilter !== 'ALL' &&
-              order.status !== orderStatusFilter
-            ) {
-              return false;
-            }
-
             if (!query) {
               return true;
             }
@@ -211,7 +195,7 @@ export function OrdersScreen({
         };
       })
       .filter((section) => section.orders.length > 0);
-  }, [tableSections, orderStatusFilter, ordersSearchQuery]);
+  }, [tableSections, ordersSearchQuery]);
 
   // ─────────────────────────────────────────────
   // Aggregate a table's orders into one tab-card: merged item names + total
@@ -348,54 +332,6 @@ export function OrdersScreen({
             )}
           </View>
         </View>
-
-        {/* Status filters */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.filterScroll}
-          contentContainerStyle={styles.chipsRow}
-        >
-          {(
-            [
-              'ALL',
-              'SERVED',
-            ] as const
-          ).map((status) => {
-            const isActive =
-              orderStatusFilter === status;
-
-            return (
-              <Hoverable
-                key={status}
-                style={[
-                  styles.chip,
-                  isActive && styles.chipActive,
-                ]}
-                onPress={() =>
-                  setOrderStatusFilter(status)
-                }
-                hoverOpacity={0.8}
-                accessibilityRole="button"
-                accessibilityState={{
-                  selected: isActive,
-                }}
-              >
-                <Text
-                  style={[
-                    styles.chipText,
-                    isActive && styles.chipTextActive,
-                  ]}
-                >
-                  {status === 'ALL'
-                    ? 'All'
-                    : status.charAt(0) +
-                      status.slice(1).toLowerCase()}
-                </Text>
-              </Hoverable>
-            );
-          })}
-        </ScrollView>
 
         {/* Book table for ordering */}
         <View style={styles.bookTableRow}>
@@ -688,48 +624,6 @@ const createStyles = (bp: ReturnType<typeof useResponsive>) => StyleSheet.create
     fontSize: getFontSize(bp.breakpoint, 'md'),
     color: TEXT_DARK,
     paddingVertical: 0,
-  },
-
-  // Filters
-  filterScroll: {
-    flexGrow: 0,
-    flexShrink: 0,
-    backgroundColor: BG_DARK,
-  },
-
-  chipsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: getSpacing(bp.breakpoint, 'md'),
-    paddingVertical: getSpacing(bp.breakpoint, 'sm'),
-    gap: getSpacing(bp.breakpoint, 'sm'),
-  },
-
-  chip: {
-    height: getResponsiveValue({ xs: 34, sm: 36, md: 38, lg: 40, xl: 42 }, bp.breakpoint),
-    paddingHorizontal: getSpacing(bp.breakpoint, 'md'),
-    borderRadius: getResponsiveValue({ xs: 17, sm: 18, md: 19, lg: 20, xl: 21 }, bp.breakpoint),
-    backgroundColor: BG_SURFACE,
-    borderWidth: 1,
-    borderColor: BORDER_COLOR,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-
-  chipActive: {
-    backgroundColor: BRAND_ORANGE,
-    borderColor: BRAND_ORANGE,
-  },
-
-  chipText: {
-    fontSize: getFontSize(bp.breakpoint, 'sm'),
-    fontWeight: '600',
-    color: TEXT_MUTED,
-  },
-
-  chipTextActive: {
-    color: BRAND_WHITE,
-    fontWeight: '800',
   },
 
   // Book table CTA

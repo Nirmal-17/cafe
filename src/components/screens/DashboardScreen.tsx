@@ -28,6 +28,7 @@ import { FloorPlanGrid } from '@/components/dashboard/FloorPlanGrid';
 import { TableTabsCard } from '@/components/dashboard/TableTabsCard';
 import { isOpenOrder } from '@/utils/openValue';
 import { filterWaiterDashboardTables } from '@/utils/waiterTables';
+import { isBillRequested } from '@/utils/billRequested';
 
 interface DashboardScreenProps {
   user: StaffUser | null;
@@ -103,6 +104,7 @@ export function DashboardScreen({
   // ── Extra data: today's paid total for the KPI (own cadence, deduped) ──
   const [todayPaidTotal, setTodayPaidTotal] = useState(0);
   const lastExtrasAtRef = useRef(0);
+  const todayPaidRef = useRef(todayPaidTotal);
 
   const loadExtras = useCallback(
     async (force = false) => {
@@ -125,30 +127,56 @@ export function DashboardScreen({
 
       if (ordersRes.success && ordersRes.data) {
         const orders = ordersRes.data.orders;
-        const paid = orders.filter((o) => o.paymentStatus === 'PAID');
-        const revenue = paid.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
-        setTodayPaidTotal(revenue);
+        const baseUrl = api.getBaseUrl();
+        const seen = new Set<number>();
+        let revenue = 0;
+        for (const o of orders) {
+          const billed =
+            o.paymentStatus === 'PAID' ||
+            Boolean((o as { billRequested?: boolean }).billRequested) ||
+            isBillRequested(o.id, baseUrl);
+          if (!billed) continue;
+          const id = Number(o.id);
+          if (Number.isFinite(id)) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+          }
+          revenue += Number(o.totalAmount || 0);
+        }
+        // Bill-requested rows still only in the live active list count too.
+        for (const o of activeOrders) {
+          const id = Number(o.id);
+          if (!Number.isFinite(id) || seen.has(id)) continue;
+          const billed =
+            o.paymentStatus === 'PAID' ||
+            Boolean((o as { billRequested?: boolean }).billRequested) ||
+            isBillRequested(o.id, baseUrl);
+          if (!billed) continue;
+          seen.add(id);
+          revenue += Number(o.totalAmount || 0);
+        }
+        todayPaidRef.current = revenue;
       }
     },
-    [],
+    [activeOrders],
   );
 
   useEffect(() => {
-    loadExtras(true);
+    loadExtras(true).then(() => setTodayPaidTotal(todayPaidRef.current));
   }, [loadExtras]);
 
   // Reload after a pull-to-refresh completes
   const wasRefreshing = useRef(false);
   useEffect(() => {
     if (wasRefreshing.current && !refreshing) {
-      loadExtras(true);
+      loadExtras(true).then(() => setTodayPaidTotal(todayPaidRef.current));
     }
     wasRefreshing.current = refreshing;
   }, [refreshing, loadExtras]);
 
   // Parent refetches activeOrders on event/poll/status changes — piggyback (throttled)
   useEffect(() => {
-    loadExtras(false);
+    loadExtras(false).then(() => setTodayPaidTotal(todayPaidRef.current));
   }, [activeOrders, loadExtras]);
 
   // ── Waiter dashboard shows ONLY the venue allowlist (IN 1-5, R 1-3,
@@ -175,14 +203,6 @@ export function DashboardScreen({
     () =>
       activeOrders
         .filter((o) => o.status === 'READY')
-        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()),
-    [activeOrders],
-  );
-
-  const attentionOrders = useMemo(
-    () =>
-      activeOrders
-        .filter((o) => o.status === 'PENDING' || o.status === 'CONFIRMED' || o.status === 'PREPARING')
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()),
     [activeOrders],
   );
@@ -409,19 +429,6 @@ export function DashboardScreen({
                 : undefined
             }
             busyOrderIds={servingIds}
-            onViewAll={() => onNavigateToTab('orders')}
-          />
-        )}
-
-        {/* NEEDS ATTENTION — pending / preparing */}
-        {attentionOrders.length > 0 && (
-          <OrderActionList
-            title="In the Kitchen"
-            icon="clock-alert"
-            color={COLORS.orange}
-            orders={attentionOrders}
-            getElapsed={getElapsedDiningTime}
-            onOrderPress={openOrder}
             onViewAll={() => onNavigateToTab('orders')}
           />
         )}

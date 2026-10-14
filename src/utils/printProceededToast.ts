@@ -11,7 +11,7 @@ function formatTableLabel(tableNumber?: string): string | null {
   return /^table\s/i.test(tableNumber) ? tableNumber : `Table ${tableNumber}`;
 }
 
-export function notifyPrintProceeded(orderId: number | string | null | undefined, tableNumber?: string): void {
+export function notifyPrintProceeded(orderId: number | string | null | undefined, tableNumber?: string, tableId?: number | string | null): void {
   const id = Number(orderId);
   if (!Number.isFinite(id)) return;
 
@@ -27,12 +27,20 @@ export function notifyPrintProceeded(orderId: number | string | null | undefined
   }
 
   const tableLabel = formatTableLabel(tableNumber);
+  const tid = Number(tableId);
   showBottomToast({
     title: 'Proceeded for Printing',
     message: tableLabel
       ? `${tableLabel} — order #${id} proceeding to print bill`
       : `Order #${id} proceeding to print bill`,
     tone: 'success',
+    notification: {
+      type: 'print_proceeded',
+      orderId: id,
+      tableId: Number.isFinite(tid) ? tid : undefined,
+      tableNumber,
+      orderStatus: 'PRINTED',
+    },
   });
   playAlertSound();
 }

@@ -219,7 +219,7 @@ const handleSearch = useCallback((q: string) => {
       const order = orders.find(o => o.id === orderId);
       const success = await executeOrderPrint(orderId, order);
       if (success) {
-        notifyPrintProceeded(orderId, order?.table?.tableNumber);
+        notifyPrintProceeded(orderId, order?.table?.tableNumber, order?.tableId);
       } else {
         showBottomToast({
           title: 'Printing',

@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   BackHandler,
   Platform,
+  AppState,
   useWindowDimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -121,6 +122,55 @@ export default function PlaceOrderScreen() {
     queueMicrotask(() => { if (mounted) fetchData(); });
     return () => { mounted = false; };
   }, [fetchData]);
+
+  // Live sync: another device may change this table (status, new order) or the
+  // menu (availability) while the pad is open — refetch on those events, and
+  // poll regularly in case the event stream is down.
+  useEffect(() => {
+    if (!id) return;
+    const tableIdNum = Number(id);
+    const unsubscribe = api.subscribeToEvents((event) => {
+      const type = event?.type;
+      if (type === 'menu.availability') { fetchData(); return; }
+      const payloadTableId = event?.payload?.tableId;
+      if (payloadTableId != null && Number(payloadTableId) !== tableIdNum) return;
+      if (
+        type === 'order.created' ||
+        type === 'order.status' ||
+        type === 'order.paid' ||
+        type === 'order.cancelled' ||
+        type === 'table.status' ||
+        type === 'table.session'
+      ) {
+        fetchData();
+      }
+    });
+    const intervalId = setInterval(() => { fetchData(); }, 15000);
+    return () => {
+      unsubscribe();
+      clearInterval(intervalId);
+    };
+  }, [id, fetchData]);
+
+  // Refetch as soon as this screen regains focus.
+  useEffect(() => {
+    if (!id) return;
+    if (Platform.OS === 'web') {
+      if (typeof window === 'undefined' || typeof document === 'undefined') return;
+      const onFocus = () => { fetchData(); };
+      const onVisibility = () => { if (document.visibilityState === 'visible') fetchData(); };
+      window.addEventListener('focus', onFocus);
+      document.addEventListener('visibilitychange', onVisibility);
+      return () => {
+        window.removeEventListener('focus', onFocus);
+        document.removeEventListener('visibilitychange', onVisibility);
+      };
+    }
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') fetchData();
+    });
+    return () => { sub.remove(); };
+  }, [id, fetchData]);
 
   // Dynamic grid metrics: compute column count and card width from actual window
   // dimensions so the menu grid adapts to any screen size.
@@ -241,6 +291,13 @@ export default function PlaceOrderScreen() {
       });
       if (response.success && response.data) {
         submissionIdRef.current = null; // fresh ID for the next cart
+        const orderedTableId = Number(id);
+        // Order taken → this specific table becomes Reserved (e.g. indoor IN1
+        // stays blocked until its bill is requested). Best-effort server PATCH;
+        // api.updateTableStatus remembers the flip locally when the host has
+        // no such route, so the floor plan still shows Reserved.
+        assignReservationId(orderedTableId);
+        api.updateTableStatus(orderedTableId, 'RESERVED').catch(() => {});
         setSelectedItems(new Map());
         setKitchenNotes('');
         setCounterNotes('');
@@ -274,7 +331,7 @@ export default function PlaceOrderScreen() {
             {
               text: 'Yes',
               onPress: () => {
-                notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
+                notifyPrintProceeded(createdOrder?.id, tableNumberForToast, table?.id);
                 goToDashboard();
               },
             },
@@ -290,7 +347,7 @@ export default function PlaceOrderScreen() {
           {
             text: 'Yes',
             onPress: () => {
-              notifyPrintProceeded(createdOrder?.id, tableNumberForToast);
+              notifyPrintProceeded(createdOrder?.id, tableNumberForToast, table?.id);
               goToDashboard();
             },
           },

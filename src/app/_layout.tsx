@@ -2,7 +2,7 @@ import { Slot, DarkTheme, DefaultTheme, ThemeProvider, useRouter, usePathname } 
 import * as SplashScreen from 'expo-splash-screen';
 // Web-only global stylesheet (ignored on native) — larger, styled scrollbars.
 import '../scrollbars.css';
-import { useColorScheme } from 'react-native';
+import { Platform, useColorScheme } from 'react-native';
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { AlertDialog } from '@/components/AlertDialog';
 import { BottomToast } from '@/components/BottomToast';
@@ -10,8 +10,8 @@ import { useEffect, useRef, useState } from 'react';
 import { api, TABLE_STATUS_OVERRIDES_KEY } from '@/services/api';
 import { OFFLINE_ORDERS_KEY } from '@/utils/offlineOrders';
 import { BILL_REQUESTED_KEY } from '@/utils/billRequested';
-import { BASE_URL_STORAGE_KEY } from '@/config/apiConfig';
-import { getStorageItemSync, initStorageHydration } from '@/utils/storage';
+import { BASE_URL_STORAGE_KEY, isLocalDevHost, pinToCentralUrl } from '@/config/apiConfig';
+import { getStorageItemSync, initStorageHydration, removeStorageItemSync } from '@/utils/storage';
 import { loadSession } from '@/utils/sessions';
 import { RESERVATIONS_STORAGE_KEY, primeReservations } from '@/utils/reservations';
 import {
@@ -70,6 +70,15 @@ export default function Layout() {
     let cancelled = false;
     const applyPersisted = () => {
       if (cancelled) return;
+      // Centralized backend first: on web production this drops any
+      // per-browser saved override so every browser uses the same server/DB.
+      pinToCentralUrl();
+      if (Platform.OS === 'web' && !isLocalDevHost()) {
+        // Converge stale device-local table statuses: entries remembered by
+        // older builds would otherwise keep showing this browser a different
+        // floor plan than every other client. Server state is the truth.
+        removeStorageItemSync(TABLE_STATUS_OVERRIDES_KEY);
+      }
       // URL first: the session (token) is looked up per server URL.
       const savedBaseUrl = getStorageItemSync(BASE_URL_STORAGE_KEY);
       if (savedBaseUrl && savedBaseUrl.trim()) {
